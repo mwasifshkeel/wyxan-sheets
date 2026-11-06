@@ -1,16 +1,19 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type KeyboardEvent } from 'react';
-import { addressAt, bounds, clampPosition, parseAddress, type Selection } from '@/lib/address';
-import { clipboardText, parsePastedText, pasteChanges, selectionToTsv } from '@/lib/clipboard';
+import { addressAt, bounds, clampPosition, isWithin, parseAddress, type Selection } from '@/lib/address';
+import { clipboardMatrix, clipboardToken, INTERNAL_CLIPBOARD_TYPE, PASTE_LIMIT, parsePastedText, pasteChanges, selectionToHtml, selectionToTsv } from '@/lib/clipboard';
 import { displayValue, FormulaEngine, isFormulaError } from '@/lib/formulas';
 import { applyEntry, History } from '@/lib/history';
-import { DEFAULT_COL_WIDTH, MAX_COLS, type CellChange, type HistoryEntry, type SavePhase, type Sheet, type Workbook } from '@/lib/types';
+import { DEFAULT_COL_WIDTH, INITIAL_COLS, MAX_COLS, MAX_ROWS, type CellChange, type HistoryEntry, type SavePhase, type Sheet, type Workbook } from '@/lib/types';
 import { Grid, type GridHandle } from './Grid';
 import { Icon } from './Icons';
+import { FormulaInput } from './FormulaInput';
+import { FunctionDialog } from './FunctionDialog';
 
 const BACKUP_KEY = 'tally:studio:pending';
 const initialSelection = { anchor: { row: 6, col: 1 }, focus: { row: 6, col: 1 } };
+type SheetClipboardEvent = Pick<ClipboardEvent<HTMLDivElement>, 'target' | 'clipboardData' | 'preventDefault'>;
 
 function readStoredBackup(): { workbook: Workbook } | null {
   try {
@@ -22,11 +25,18 @@ function readStoredBackup(): { workbook: Workbook } | null {
   } catch { return null; }
 }
 
+const navigate = (sheetId: string, row: number, col: number, push = false) => {
+  const url = `/s/${encodeURIComponent(sheetId)}?cell=${addressAt(row, col)}`;
+  if (push) window.history.pushState(null, '', url);
+  else window.history.replaceState(null, '', url);
+};
+
 export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   const [workbook, setWorkbook] = useState<Workbook | null>(null);
   const workbookRef = useRef<Workbook | null>(null);
   const enginesRef = useRef<Map<string, FormulaEngine>>(new Map());
-  const historyRef = useRef(new History());
+  const [history] = useState(() => new History());
+  const [engines, setEngines] = useState<Map<string, FormulaEngine>>(new Map());
   const [activeSheetId, setActiveSheetId] = useState(initialSheetId);
   const [selection, setSelection] = useState<Selection>(initialSelection);
   const selectionRef = useRef<Selection>(initialSelection);
@@ -38,34 +48,51 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   const [message, setMessage] = useState('');
   const [renameId, setRenameId] = useState<string | null>(null);
   const [renameText, setRenameText] = useState('');
-  const [formulaDraft, setFormulaDraft] = useState('');
+  const cancelRenameRef = useRef(false);
+  const [formulaText, setFormulaDraft] = useState('');
   const [formulaFocused, setFormulaFocused] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [functionsOpen, setFunctionsOpen] = useState(false);
+  const [functionSource, setFunctionSource] = useState('');
+  const formulaInputRef = useRef<HTMLInputElement>(null);
+  const functionDraftRef = useRef<{ value: string; source: 'cell' | 'bar'; changed: boolean } | null>(null);
   const [theme, setTheme] = useState<'system' | 'dark' | 'light'>('system');
-  const [mobile, setMobile] = useState(false);
   const gridRef = useRef<GridHandle>(null);
   const initialLoadRef = useRef(false);
   const skipFormulaBlurRef = useRef(false);
+  const formulaAddressRef = useRef('');
+  const formulaChangedRef = useRef(false);
+  const guideRef = useRef<HTMLElement>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inFlightRef = useRef(false);
   const saveNowRef = useRef<() => Promise<void>>(async () => {});
-  const copiedRef = useRef<{ text: string; origin: { row: number; col: number }; sheetId: string } | null>(null);
+  const copiedRef = useRef<{ text: string; origin: { row: number; col: number }; sheetId: string; token: string; cut?: boolean } | null>(null);
   const activeSheet = workbook?.sheets.find(sheet => sheet.id === activeSheetId) || null;
-  const engine = enginesRef.current.get(activeSheetId);
+  const engine = engines.get(activeSheetId);
   const activeAddress = addressAt(selection.focus.row, selection.focus.col);
   const activeRaw = activeSheet?.cells[activeAddress] || '';
+  const formulaDraft = formulaFocused ? formulaText : activeRaw;
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
 
   useEffect(() => {
-    const query = window.matchMedia('(max-width: 640px)');
-    const update = () => setMobile(query.matches);
-    update();
-    query.addEventListener('change', update);
-    return () => query.removeEventListener('change', update);
-  }, []);
+    if (!helpOpen) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const guide = guideRef.current;
+    guide?.querySelector<HTMLButtonElement>('button')?.focus();
+    const keydown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === 'Escape') { event.preventDefault(); setHelpOpen(false); }
+      if (event.key !== 'Tab') return;
+      const items = Array.from(guide?.querySelectorAll<HTMLElement>('button, input, [tabindex="0"]') || []);
+      const first = items[0], last = items[items.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    };
+    document.addEventListener('keydown', keydown);
+    return () => { document.removeEventListener('keydown', keydown); previous?.focus(); };
+  }, [helpOpen]);
 
   const initialize = useCallback(async () => {
     setSavePhase('loading');
@@ -81,7 +108,8 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
       workbookRef.current = next;
       setWorkbook(next);
       enginesRef.current = new Map(next.sheets.map(sheet => [sheet.id, new FormulaEngine(sheet.cells)]));
-      historyRef.current.reset();
+      setEngines(new Map(enginesRef.current));
+      history.reset();
       revisionRef.current = 0;
       persistedRevRef.current = recover ? -1 : 0;
       setRevision(0);
@@ -99,11 +127,12 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
         workbookRef.current = next;
         setWorkbook(next);
         enginesRef.current = new Map(next.sheets.map(sheet => [sheet.id, new FormulaEngine(sheet.cells)]));
+        setEngines(new Map(enginesRef.current));
         setSavePhase('failed');
         setMessage('Working from the browser recovery copy. Saving can be retried.');
       } else setLoadError(error instanceof Error ? error.message : 'Unable to load the workbook.');
     }
-  }, []);
+  }, [history]);
 
   useEffect(() => { if (initialLoadRef.current) return; initialLoadRef.current = true; void initialize(); }, [initialize]);
 
@@ -121,10 +150,6 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
     window.addEventListener('popstate', restore);
     return () => window.removeEventListener('popstate', restore);
   }, []);
-
-  useEffect(() => {
-    if (!formulaFocused) setFormulaDraft(activeRaw);
-  }, [activeRaw, activeSheetId, activeAddress, formulaFocused, revision]);
 
   useEffect(() => () => {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -150,7 +175,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
       persistedRevRef.current = sentRevision;
       if (revisionRef.current === sentRevision) {
         const latest = workbookRef.current;
-        if (latest) { latest.updatedAt = result.updatedAt; setWorkbook({ ...latest }); }
+        if (latest) { const saved = { ...latest, updatedAt: result.updatedAt }; workbookRef.current = saved; setWorkbook(saved); }
         localStorage.removeItem(BACKUP_KEY);
         setSavePhase('saved');
         setMessage('');
@@ -166,7 +191,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
       inFlightRef.current = false;
     }
   }, []);
-  saveNowRef.current = saveNow;
+  useEffect(() => { saveNowRef.current = saveNow; }, [saveNow]);
 
   const dirty = useCallback((next: Workbook) => {
     const rev = ++revisionRef.current;
@@ -181,55 +206,61 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
 
   const updateEngine = (entry: HistoryEntry, reverse = false) => {
     if (entry.kind === 'cells') enginesRef.current.get(entry.sheetId)?.patch(entry.changes.map(change => ({ address: change.address, after: reverse ? change.before : change.after })));
-    if (entry.kind === 'add') {
-      if (reverse) enginesRef.current.delete(entry.sheet.id);
+    if (entry.kind === 'add' || entry.kind === 'delete') {
+      const remove = entry.kind === 'add' ? reverse : !reverse;
+      if (remove) enginesRef.current.delete(entry.sheet.id);
       else enginesRef.current.set(entry.sheet.id, new FormulaEngine(entry.sheet.cells));
+      setEngines(new Map(enginesRef.current));
     }
   };
 
   const commit = useCallback((entry: HistoryEntry) => {
     const previous = workbookRef.current;
     if (!previous) return;
+    if (entry.kind === 'cells') {
+      const sheetId = entry.sheetId;
+      entry = { ...entry, columnsBefore: previous.sheets.find(sheet => sheet.id === sheetId)?.widths.length };
+    }
     const next = applyEntry(previous, entry);
     if (next === previous) return;
     updateEngine(entry);
-    historyRef.current.record(entry);
+    history.record(entry);
     workbookRef.current = next;
     setWorkbook(next);
     dirty(next);
-  }, [dirty]);
+  }, [dirty, history]);
 
   const undo = useCallback(() => {
     const current = workbookRef.current;
     if (!current) return;
-    const { workbook: next, entry } = historyRef.current.undoDetailed(current);
+    const { workbook: next, entry } = history.undoDetailed(current);
     if (!entry) return;
     updateEngine(entry, true);
-    if (entry.kind === 'add' && activeSheetId === entry.sheet.id) {
+    if (!next.sheets.some(sheet => sheet.id === activeSheetId)) {
       const fallback = next.sheets[0]?.id || 'budget';
       setActiveSheetId(fallback); navigate(fallback, 0, 0, true);
     }
     workbookRef.current = next; setWorkbook(next); dirty(next);
-  }, [dirty, activeSheetId]);
+  }, [dirty, activeSheetId, history]);
 
   const redo = useCallback(() => {
     const current = workbookRef.current;
     if (!current) return;
-    const { workbook: next, entry } = historyRef.current.redoDetailed(current);
+    const { workbook: next, entry } = history.redoDetailed(current);
     if (!entry) return;
     updateEngine(entry);
+    if (!next.sheets.some(sheet => sheet.id === activeSheetId)) {
+      const fallback = next.sheets[0].id;
+      setActiveSheetId(fallback); navigate(fallback, 0, 0, true);
+    }
     workbookRef.current = next; setWorkbook(next); dirty(next);
-  }, [dirty]);
-
-  const navigate = (sheetId: string, row: number, col: number, push = false) => {
-    const url = `/s/${encodeURIComponent(sheetId)}?cell=${addressAt(row, col)}`;
-    if (push) window.history.pushState(null, '', url);
-    else window.history.replaceState(null, '', url);
-  };
+  }, [dirty, activeSheetId, history]);
 
   const select = useCallback((row: number, col: number, extend = false, push = false) => {
     const position = clampPosition(row, col);
     const next: Selection = { anchor: extend ? selectionRef.current.anchor : position, focus: position };
+    const previous = selectionRef.current;
+    if (previous.focus.row === next.focus.row && previous.focus.col === next.focus.col && previous.anchor.row === next.anchor.row && previous.anchor.col === next.anchor.col) return;
     selectionRef.current = next;
     setSelection(next);
     navigate(activeSheetId, position.row, position.col, push);
@@ -248,76 +279,155 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
 
   const changeCell = useCallback((address: string, value: string) => {
     const current = workbookRef.current?.sheets.find(sheet => sheet.id === activeSheetId);
-    if (!current || mobile) return;
+    if (!current) return;
     const before = current.cells[address] || '';
     const after = value.slice(0, 4000);
     if (before !== after) commit({ kind: 'cells', sheetId: activeSheetId, changes: [{ address, before, after }] });
-  }, [activeSheetId, commit, mobile]);
+  }, [activeSheetId, commit]);
 
-  const clearSelection = useCallback(() => {
-    if (!activeSheet || mobile) return;
-    const rect = bounds(selectionRef.current);
+  const clearSelection = () => {
+    if (!activeSheet) return;
     const changes: CellChange[] = [];
-    for (let row = rect.top; row <= rect.bottom; row++) for (let col = rect.left; col <= rect.right; col++) {
-      const address = addressAt(row, col);
-      const before = activeSheet.cells[address];
-      if (before) changes.push({ address, before, after: '' });
+    for (const [address, before] of Object.entries(activeSheet.cells)) {
+      const position = parseAddress(address);
+      if (position && isWithin(selectionRef.current, position.row, position.col)) changes.push({ address, before, after: '' });
     }
     if (changes.length) commit({ kind: 'cells', sheetId: activeSheetId, changes });
-  }, [activeSheet, activeSheetId, commit, mobile]);
-
-  const copy = (event: ClipboardEvent<HTMLDivElement>) => {
-    if (!activeSheet || event.target instanceof HTMLInputElement) return;
-    const text = selectionToTsv(selectionRef.current, activeSheet.cells);
-    event.clipboardData.setData('text/plain', text);
-    event.preventDefault();
-    const b = bounds(selectionRef.current);
-    copiedRef.current = { text, origin: { row: b.top, col: b.left }, sheetId: activeSheetId };
-    setMessage('Selection copied');
   };
 
-  const paste = (event: ClipboardEvent<HTMLDivElement>) => {
-    if (!activeSheet || mobile || event.target instanceof HTMLInputElement) return;
-    const text = clipboardText(event.clipboardData);
-    if (!text) return;
+  const rememberCopy = (text: string, cut = false) => {
+    const b = bounds(selectionRef.current);
+    const token = crypto.randomUUID();
+    copiedRef.current = { text, origin: { row: b.top, col: b.left }, sheetId: activeSheetId, token, cut };
+    return token;
+  };
+
+  const copy = (event: SheetClipboardEvent, cutting = false) => {
+    if (!activeSheet || event.target instanceof HTMLInputElement) return;
     event.preventDefault();
-    const matrix = parsePastedText(text);
+    try {
+      const text = selectionToTsv(selectionRef.current, activeSheet.cells);
+      const token = rememberCopy(text, cutting);
+      event.clipboardData.setData('text/plain', text);
+      event.clipboardData.setData('text/html', selectionToHtml(selectionRef.current, activeSheet.cells, token));
+      event.clipboardData.setData(INTERNAL_CLIPBOARD_TYPE, token);
+      if (cutting) clearSelection();
+      setMessage(cutting ? 'Selection cut. Paste to move it; undo restores it.' : 'Selection copied');
+    } catch (error) { setMessage((error as Error).message); }
+  };
+
+  const applyPaste = (matrix: string[][], token = '', text = '') => {
+    const sheet = workbookRef.current?.sheets.find(sheet => sheet.id === activeSheetId);
+    if (!sheet || !matrix.length) return;
     const rectangle = bounds(selectionRef.current);
     const origin = { row: rectangle.top, col: rectangle.left };
-    const copied = copiedRef.current && copiedRef.current.text === text && copiedRef.current.sheetId === activeSheetId ? copiedRef.current.origin : undefined;
-    const changes = pasteChanges(activeSheet.cells, matrix, origin, copied);
+    const copied = copiedRef.current;
+    const internal = copied && !copied.cut && copied.token === token && copied.text === text ? copied.origin : undefined;
+    // pasting one value into a range fills that range as one undo step.
+    if (matrix.length === 1 && matrix[0].length === 1 && (rectangle.bottom !== rectangle.top || rectangle.right !== rectangle.left)) {
+      const size = (rectangle.bottom - rectangle.top + 1) * (rectangle.right - rectangle.left + 1);
+      if (size > PASTE_LIMIT) { setMessage('Fill up to 50,000 cells at a time.'); return; }
+      matrix = Array.from({ length: rectangle.bottom - rectangle.top + 1 }, () => Array(rectangle.right - rectangle.left + 1).fill(matrix[0][0]));
+    }
+    const changes = pasteChanges(sheet.cells, matrix, origin, internal);
     if (changes.length) commit({ kind: 'cells', sheetId: activeSheetId, changes });
-    const next = clampPosition(origin.row + matrix.length - 1, origin.col + Math.max(0, ...matrix.map(row => row.length - 1)));
+    const width = matrix.reduce((n, row) => Math.max(n, row.length), 0);
+    const next = clampPosition(origin.row + matrix.length - 1, origin.col + width - 1);
     const selectionNext = { anchor: origin, focus: next };
-    selectionRef.current = selectionNext;
-    setSelection(selectionNext);
-    setMessage(`Pasted ${changes.length.toLocaleString()} changed cells${matrix.reduce((n, r) => n + r.length, 0) >= 50000 ? ' (50,000 cell limit)' : ''}`);
+    selectionRef.current = selectionNext; setSelection(selectionNext);
+    navigate(activeSheetId, next.row, next.col);
+    const clipped = origin.row + matrix.length > MAX_ROWS || origin.col + width > MAX_COLS;
+    setMessage(`Pasted ${changes.length.toLocaleString()} changed cells${clipped ? ' · clipped at the sheet edge' : matrix.reduce((n, row) => n + row.length, 0) >= PASTE_LIMIT ? ' · 50,000 cell limit' : ''}`);
   };
 
-  const cut = (event: ClipboardEvent<HTMLDivElement>) => { copy(event); if (!mobile) clearSelection(); };
+  const paste = (event: SheetClipboardEvent) => {
+    if (!activeSheet || event.target instanceof HTMLInputElement) return;
+    event.preventDefault();
+    try {
+      const matrix = clipboardMatrix(event.clipboardData);
+      if (!matrix.length) { setMessage('Paste text or a table. Images are not supported.'); return; }
+      applyPaste(matrix, clipboardToken(event.clipboardData), event.clipboardData.getData('text/plain'));
+    } catch (error) { setMessage((error as Error).message); }
+  };
+  const cut = (event: SheetClipboardEvent) => copy(event, true);
 
   const copyButton = async () => {
     if (!activeSheet) return;
-    const text = selectionToTsv(selectionRef.current, activeSheet.cells);
     try {
-      await navigator.clipboard.writeText(text);
-      const b = bounds(selectionRef.current);
-      copiedRef.current = { text, origin: { row: b.top, col: b.left }, sheetId: activeSheetId };
+      const text = selectionToTsv(selectionRef.current, activeSheet.cells);
+      const token = rememberCopy(text);
+      if (typeof ClipboardItem !== 'undefined' && navigator.clipboard.write) {
+        const html = selectionToHtml(selectionRef.current, activeSheet.cells, token);
+        try {
+          await navigator.clipboard.write([new ClipboardItem({ 'text/plain': new Blob([text], { type: 'text/plain' }), 'text/html': new Blob([html], { type: 'text/html' }) })]);
+        } catch { await navigator.clipboard.writeText(text); }
+      } else await navigator.clipboard.writeText(text);
       setMessage('Selection copied');
-    } catch { setMessage('Select the grid and press Ctrl+C or Command+C to copy.'); gridRef.current?.focus(); }
+    } catch (error) {
+      setMessage(error instanceof Error && error.message.startsWith('Copy up to') ? error.message : 'Clipboard unavailable. Focus the grid and use Ctrl/Cmd+C.');
+      gridRef.current?.focus();
+    }
   };
+  const pasteButton = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text) { setMessage('The clipboard has no text to paste.'); return; }
+      const copied = copiedRef.current;
+      applyPaste(parsePastedText(text), copied?.text === text ? copied.token : '', text);
+    } catch (error) {
+      setMessage(error instanceof Error && error.message.startsWith('Paste less') ? error.message : 'Clipboard unavailable. Focus the grid and use Ctrl/Cmd+V, or paste into the formula bar.');
+    }
+  };
+
+  useEffect(() => {
+    // firefox sends clipboard events to the document for a focused non-editable grid.
+    const forward = (event: globalThis.ClipboardEvent) => {
+      if (event.defaultPrevented || !event.clipboardData || document.activeElement?.getAttribute('role') !== 'grid') return;
+      const input: SheetClipboardEvent = { target: event.target!, clipboardData: event.clipboardData, preventDefault: () => event.preventDefault() };
+      if (event.type === 'copy') copy(input);
+      else if (event.type === 'cut') cut(input);
+      else paste(input);
+    };
+    document.addEventListener('copy', forward);
+    document.addEventListener('cut', forward);
+    document.addEventListener('paste', forward);
+    return () => {
+      document.removeEventListener('copy', forward);
+      document.removeEventListener('cut', forward);
+      document.removeEventListener('paste', forward);
+    };
+  });
 
   const addSheet = () => {
     const current = workbookRef.current;
     if (!current || current.sheets.length >= 15) { setMessage('This workbook supports up to 15 sheets.'); return; }
-    const id = `sheet-${Date.now().toString(36)}`;
-    const sheet: Sheet = { id, name: `Untitled ${current.sheets.length - 2}`, cells: {}, widths: Array(MAX_COLS).fill(DEFAULT_COL_WIDTH), frozen: true };
+    const id = `sheet-${crypto.randomUUID()}`;
+    let number = 1;
+    while (current.sheets.some(sheet => sheet.name === `Sheet ${number}`)) number++;
+    const sheet: Sheet = { id, name: `Sheet ${number}`, cells: {}, widths: Array(INITIAL_COLS).fill(DEFAULT_COL_WIDTH), frozen: false };
     commit({ kind: 'add', sheet });
     switchSheet(id);
-    setRenameId(id); setRenameText(sheet.name);
+    cancelRenameRef.current = false; setRenameId(id); setRenameText(sheet.name);
+  };
+
+  const deleteSheet = () => {
+    const current = workbookRef.current;
+    if (!current || !activeSheet || current.sheets.length <= 1) return;
+    const index = current.sheets.findIndex(sheet => sheet.id === activeSheetId);
+    const fallback = current.sheets[index + 1] || current.sheets[index - 1];
+    commit({ kind: 'delete', sheet: activeSheet, index });
+    setRenameId(null); switchSheet(fallback.id);
+    setMessage(`Deleted ${activeSheet.name}. Undo to restore it.`);
+  };
+  const addColumn = () => {
+    if (!activeSheet || activeSheet.widths.length >= MAX_COLS) return;
+    const after = [...activeSheet.widths, DEFAULT_COL_WIDTH];
+    commit({ kind: 'columns', sheetId: activeSheetId, before: activeSheet.widths, after });
+    select(selection.focus.row, after.length - 1);
   };
 
   const completeRename = () => {
+    if (cancelRenameRef.current) { cancelRenameRef.current = false; setRenameId(null); return; }
     if (!renameId || !workbookRef.current) { setRenameId(null); return; }
     const current = workbookRef.current.sheets.find(sheet => sheet.id === renameId);
     const name = renameText.trim().slice(0, 80);
@@ -334,19 +444,23 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
       const next = await response.json() as Workbook;
       workbookRef.current = next; setWorkbook(next);
       enginesRef.current = new Map(next.sheets.map(sheet => [sheet.id, new FormulaEngine(sheet.cells)]));
-      historyRef.current.reset();
+      setEngines(new Map(enginesRef.current));
+      history.reset();
       revisionRef.current = 0; persistedRevRef.current = 0; setRevision(0); setSavePhase('saved'); setMessage('Demo data restored');
       switchSheet('budget');
     } catch { setMessage('Reset failed. Check the server connection.'); }
   };
 
+  const populatedCells = useMemo(() => Object.entries(activeSheet?.cells || {}).map(([address, raw]) => ({
+    address, raw, position: parseAddress(address),
+  })), [activeSheet?.cells]);
+
   const stats = useMemo(() => {
     if (!activeSheet || !engine) return { count: 0, sum: 0, average: 0 };
-    const rect = bounds(selection);
     let count = 0, numericCount = 0, sum = 0;
-    for (let row = rect.top; row <= rect.bottom; row++) for (let col = rect.left; col <= rect.right; col++) {
-      const address = addressAt(row, col), raw = activeSheet.cells[address] || '';
-      if (!raw) continue;
+    const rectangle = bounds(selection);
+    for (const { address, raw, position } of populatedCells) {
+      if (!raw || !position || position.row < rectangle.top || position.row > rectangle.bottom || position.col < rectangle.left || position.col > rectangle.right) continue;
       count++;
       const result = engine.evaluate(address);
       if (!isFormulaError(result) && result !== '' && Number.isFinite(Number(result))) {
@@ -354,46 +468,83 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
       }
     }
     return { count, sum, average: numericCount ? sum / numericCount : 0 };
-  }, [activeSheet, engine, selection, revision]);
+  }, [activeSheet, engine, selection, populatedCells]);
+
+  const openFunctions = () => {
+    const cellDraft = gridRef.current?.takeDraft() ?? null;
+    functionDraftRef.current = cellDraft !== null ? { value: cellDraft, source: 'cell', changed: true } : formulaFocused ? { value: formulaDraft, source: 'bar', changed: formulaChangedRef.current } : null;
+    setFunctionSource(cellDraft ?? formulaDraft);
+    if (formulaFocused) {
+      skipFormulaBlurRef.current = true;
+      setFormulaFocused(false);
+    }
+    setHelpOpen(false);
+    setFunctionsOpen(true);
+  };
+
+  const closeFunctions = () => {
+    const draft = functionDraftRef.current;
+    functionDraftRef.current = null;
+    setFunctionsOpen(false);
+    requestAnimationFrame(() => {
+      if (draft?.source === 'cell') gridRef.current?.edit(draft.value);
+      else if (draft?.source === 'bar') {
+        formulaInputRef.current?.focus();
+        setFormulaDraft(draft.value);
+        formulaChangedRef.current = draft.changed;
+        setFormulaFocused(true);
+      } else gridRef.current?.focus();
+    });
+  };
 
   const activeResult = engine ? displayValue(engine.evaluate(activeAddress)) : '';
   const saveText = savePhase === 'saved' ? 'All changes saved' : savePhase === 'saving' ? 'Saving changes' : savePhase === 'failed' ? 'Save failed. Retry' : savePhase === 'local' ? 'Changes on this device' : 'Loading';
 
-  if (loadError) return <main className="empty-page"><section className="empty-card"><span className="empty-mark"><Icon name="alert" size={26} /></span><h1>Couldn't open the workbook.</h1><p>{loadError}</p><button className="primary-button" onClick={() => void initialize()}>Try again</button></section></main>;
+  if (loadError) return <main className="empty-page"><section className="empty-card"><span className="empty-mark"><Icon name="alert" size={26} /></span><h1>Couldn&apos;t open the workbook.</h1><p>{loadError}</p><button className="primary-button" onClick={() => void initialize()}>Try again</button></section></main>;
   if (!workbook) return <div className="app-shell loading-state"><header className="topbar"><div className="brand-mark"><Icon name="grid" /></div><b className="brand-name">tally</b></header><div className="loading-content"><div className="loading-line wide"/><div className="loading-line"/><div className="loading-grid"/></div><p className="loading-copy" role="status">Opening Northline Studio...</p></div>;
-  if (!activeSheet || !engine) return <main className="empty-page"><section className="empty-card"><span className="empty-mark">Missing sheet</span><h1>That sheet doesn't exist.</h1><p>The address points to a sheet that isn't in this workbook.</p><button className="primary-button" onClick={() => switchSheet('budget')}>Open operating budget</button></section></main>;
+  if (!activeSheet || !engine) return <main className="empty-page"><section className="empty-card"><span className="empty-mark">Missing sheet</span><h1>That sheet doesn&apos;t exist.</h1><p>The address points to a sheet that isn&apos;t in this workbook.</p><button className="primary-button" onClick={() => switchSheet(workbook.sheets[0].id)}>Open {workbook.sheets[0].name}</button></section></main>;
 
-  return <div className="app-shell">
+  return <div className="app-shell" onKeyDownCapture={event => {
+    if (event.shiftKey && event.key === 'F3' && !functionsOpen) { event.preventDefault(); event.stopPropagation(); openFunctions(); }
+  }}>
     <header className="topbar">
-      <div className="brand-section"><span className="brand-mark"><Icon name="grid" size={21} /></span><span className="brand-name">tally</span><span className="brand-divider"/><div className="workbook-title"><strong>{workbook.name}</strong><span>Spreadsheet workspace</span></div></div>
+      <div className="brand-section"><span className="brand-mark"><Icon name="grid" size={21} /></span><span className="brand-name">tally</span><span className="brand-divider"/><div className="workbook-title"><h1>{activeSheet.name}</h1><span>{workbook.name}</span></div></div>
       <div className="header-actions">
-        <button className={`save-status ${savePhase === 'failed' ? 'failed' : ''}`} title={message || saveText} onClick={() => { if (savePhase === 'failed' || savePhase === 'local') void saveNow(); }} disabled={savePhase === 'saved' || savePhase === 'saving'}><Icon name={savePhase === 'failed' ? 'alert' : savePhase === 'saved' ? 'check' : 'refresh'} size={15}/><span>{saveText}</span></button>
+        <button className="functions-nav" aria-label="Functions" title="Functions (Shift+F3)" aria-haspopup="dialog" aria-expanded={functionsOpen} onPointerDown={event => event.preventDefault()} onClick={openFunctions}><span className="fx-label" aria-hidden="true">ƒx</span><span className="functions-nav-text">Functions</span></button>
+        <button className={`save-status ${savePhase === 'failed' ? 'failed' : ''}`} aria-label={saveText} title={message || saveText} onClick={() => { if (savePhase === 'failed' || savePhase === 'local') void saveNow(); }} disabled={savePhase === 'saved' || savePhase === 'saving'}><Icon name={savePhase === 'failed' ? 'alert' : savePhase === 'saved' ? 'check' : 'refresh'} size={15}/><span className="save-label">{saveText}</span><span className="save-mobile" aria-hidden="true">{savePhase === 'saved' ? 'Saved' : savePhase === 'saving' ? 'Saving' : savePhase === 'failed' ? 'Retry' : 'Unsaved'}</span></button>
         <span className="vertical-separator"/>
         <button className="icon-button theme-button" title="Toggle light and dark mode" aria-label="Toggle light and dark mode" onClick={() => setTheme(previous => { const current = previous === 'system' ? window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light' : previous; return current === 'light' ? 'dark' : 'light'; })}><Icon name={theme === 'dark' ? 'sun' : 'moon'} size={18}/></button>
         <button className="icon-button" title="Keyboard shortcuts" aria-label="Keyboard shortcuts" aria-expanded={helpOpen} onClick={() => setHelpOpen(previous => !previous)}><Icon name="keyboard" size={19}/></button>
       </div>
     </header>
 
-    <div className="sheet-heading"><div className="title-block"><span className="section-identifier">Workbook / {activeSheet.name}</span><h1>{activeSheet.name}</h1></div><div className="heading-right"><span className="density-indicator"><span className="density-dot"/>{activeSheetId === 'orders' ? '10,000 rows' : activeSheetId === 'budget' ? 'Operating plan' : 'Sheet view'}</span></div></div>
-
     <div className="toolbar" role="toolbar" aria-label="Sheet controls">
-      <div className="toolbar-group"><button className="tool-button" disabled={!historyRef.current.canUndo} onClick={undo} title="Undo (Ctrl+Z)"><Icon name="undo"/><span>Undo</span></button><button className="tool-button" disabled={!historyRef.current.canRedo} onClick={redo} title="Redo (Ctrl+Y)"><Icon name="redo"/><span>Redo</span></button></div>
+      <div className="toolbar-group"><button className="tool-button" disabled={!history.canUndo} onClick={undo} title="Undo (Ctrl+Z)" aria-label="Undo"><Icon name="undo"/><span>Undo</span></button><button className="tool-button" disabled={!history.canRedo} onClick={redo} title="Redo (Ctrl+Y)" aria-label="Redo"><Icon name="redo"/><span>Redo</span></button></div>
       <span className="toolbar-divider"/>
-      <div className="toolbar-group"><button className="tool-button" onClick={() => void copyButton()} title="Copy selection"><Icon name="copy"/><span>Copy</span></button><button className={`tool-button ${activeSheet.frozen ? 'is-toggled' : ''}`} disabled={mobile} onClick={() => commit({ kind: 'freeze', sheetId: activeSheetId, before: activeSheet.frozen, after: !activeSheet.frozen })} title="Toggle frozen first column"><Icon name="freeze"/><span>{activeSheet.frozen ? 'Unfreeze' : 'Freeze'} column A</span></button></div>
-      <div className="toolbar-right"><span className="shortcut-hint">Double-click to edit</span><button className="tool-button small" title="Rename this sheet" disabled={mobile} onClick={() => { setRenameId(activeSheetId); setRenameText(activeSheet.name); }}><Icon name="edit" size={16}/><span>Rename</span></button></div>
+      <div className="toolbar-group"><button className="tool-button" onClick={() => void copyButton()} title="Copy selection" aria-label="Copy selection"><Icon name="copy"/><span>Copy</span></button><button className="tool-button" onClick={() => void pasteButton()} title="Paste selection" aria-label="Paste selection"><Icon name="paste"/><span>Paste</span></button><button className={`tool-button ${activeSheet.frozen ? 'is-toggled' : ''}`} onClick={() => commit({ kind: 'freeze', sheetId: activeSheetId, before: activeSheet.frozen, after: !activeSheet.frozen })} title="Toggle frozen first column" aria-label={activeSheet.frozen ? 'Unfreeze column A' : 'Freeze column A'} aria-pressed={activeSheet.frozen}><Icon name="freeze"/><span>{activeSheet.frozen ? 'Unfreeze' : 'Freeze'} column A</span></button></div>
+      <div className="toolbar-right"><button className="tool-button" onClick={addColumn} disabled={activeSheet.widths.length >= MAX_COLS} title="Add column" aria-label="Add column"><Icon name="plus"/><span>Column</span></button><button className="tool-button small" title="Rename this sheet" aria-label="Rename this sheet" onClick={() => { cancelRenameRef.current = false; setRenameId(activeSheetId); setRenameText(activeSheet.name); }}><Icon name="edit" size={16}/><span>Rename</span></button><button className="tool-button" title="Delete this sheet" aria-label="Delete this sheet" disabled={workbook.sheets.length <= 1} onClick={deleteSheet}><Icon name="trash"/><span>Delete sheet</span></button></div>
     </div>
 
-    <div className="formula-line"><label className="address-box" htmlFor="formula-editor">{activeAddress}</label><span className="formula-symbol" aria-hidden="true">ƒx</span><input id="formula-editor" className="formula-input" aria-label={`Raw value of ${activeAddress}`} spellCheck={false} value={formulaDraft} onFocus={() => setFormulaFocused(true)} onBlur={() => { if (skipFormulaBlurRef.current) { skipFormulaBlurRef.current = false; return; } if (formulaFocused) { changeCell(activeAddress, formulaDraft); setFormulaFocused(false); } }} onChange={event => setFormulaDraft(event.target.value)} onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => { if (event.key === 'Enter') { event.preventDefault(); changeCell(activeAddress, formulaDraft); setFormulaFocused(false); gridRef.current?.focus(); } else if (event.key === 'Escape') { event.preventDefault(); skipFormulaBlurRef.current = true; setFormulaDraft(activeRaw); setFormulaFocused(false); gridRef.current?.focus(); } }} readOnly={mobile}/><span className="formula-result" title="Computed result">{activeRaw.startsWith('=') ? activeResult : ''}</span></div>
+    <div className="formula-line"><input key={activeAddress} className="address-box" aria-label="Go to cell" defaultValue={activeAddress} spellCheck={false} onKeyDown={event => {
+      if (event.key === 'Enter') {
+        const position = parseAddress(event.currentTarget.value);
+        if (position) { select(position.row, position.col, false, true); gridRef.current?.focus(); }
+        else setMessage('Enter an address from A1 to XFD10000.');
+      } else if (event.key === 'Escape') { event.currentTarget.value = activeAddress; gridRef.current?.focus(); }
+    }} /><button type="button" className="formula-symbol" aria-label="Insert function" title="Insert function (Shift+F3)" aria-haspopup="dialog" onPointerDown={event => event.preventDefault()} onClick={openFunctions}>ƒx</button><FormulaInput ref={formulaInputRef} id="formula-editor" className="formula-input" placeholder="Type a value or formula" aria-label={`Raw value of ${activeAddress}`} spellCheck={false} value={formulaDraft} onFocus={() => { formulaAddressRef.current = activeAddress; formulaChangedRef.current = false; setFormulaDraft(activeRaw); setFormulaFocused(true); }} onBlur={() => { if (skipFormulaBlurRef.current) { skipFormulaBlurRef.current = false; return; } if (formulaFocused) { if (formulaChangedRef.current) changeCell(formulaAddressRef.current || activeAddress, formulaDraft); setFormulaFocused(false); } }} onValueChange={value => { formulaChangedRef.current = true; setFormulaDraft(value); }} onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => { if (event.key === 'Enter') { event.preventDefault(); if (formulaChangedRef.current) changeCell(formulaAddressRef.current || activeAddress, formulaDraft); setFormulaFocused(false); gridRef.current?.focus(); } else if (event.key === 'Escape') { event.preventDefault(); skipFormulaBlurRef.current = true; setFormulaDraft(activeRaw); setFormulaFocused(false); gridRef.current?.focus(); } }}/><span className="formula-result" title="Computed result">{activeRaw.startsWith('=') ? activeResult : ''}</span></div>
 
-    {mobile && <div className="mobile-note">Read-only on phone. Open on a tablet or desktop to edit cells.</div>}
-
-    <div className="grid-area"><Grid key={activeSheetId} ref={gridRef} sheet={activeSheet} engine={engine} selection={selection} revision={revision} readOnly={mobile} onSelect={select} onChangeCell={changeCell} onClear={clearSelection} onUndo={undo} onRedo={redo} onCopy={copy} onCut={cut} onPaste={paste} onResize={(column, width) => { const before = activeSheet.widths[column] || DEFAULT_COL_WIDTH; if (before !== width) commit({ kind: 'width', sheetId: activeSheetId, column, before, after: width }); }}/>
-      {!Object.keys(activeSheet.cells).length && <div className="empty-sheet-hint"><div className="empty-sheet-glyph"><Icon name="grid" size={24}/></div><strong>A fresh sheet</strong><p>Choose a cell and start typing. Use the formula bar for expressions.</p></div>}
+    <div className="grid-area"><Grid key={activeSheetId} ref={gridRef} sheet={activeSheet} engine={engine} selection={selection} revision={revision} onSelect={select} onChangeCell={changeCell} onClear={clearSelection} onUndo={undo} onRedo={redo} onCopy={copy} onCut={cut} onPaste={paste} onResize={(column, width) => { const before = activeSheet.widths[column] || DEFAULT_COL_WIDTH; if (before !== width) commit({ kind: 'width', sheetId: activeSheetId, column, before, after: width }); }}/>
     </div>
 
-    <div className="bottom-bar"><div className="tab-strip" role="tablist" aria-label="Sheets">{workbook.sheets.map(sheet => renameId === sheet.id ? <input key={sheet.id} autoFocus className="rename-field" aria-label="New sheet name" maxLength={80} value={renameText} onChange={event => setRenameText(event.target.value)} onBlur={completeRename} onKeyDown={event => { if (event.key === 'Enter') completeRename(); else if (event.key === 'Escape') setRenameId(null); }} /> : <button key={sheet.id} role="tab" aria-selected={sheet.id === activeSheetId} className={`sheet-tab ${sheet.id === activeSheetId ? 'current' : ''}`} onDoubleClick={() => { if (!mobile) { setRenameId(sheet.id); setRenameText(sheet.name); } }} onClick={() => switchSheet(sheet.id)}><span className="tab-square"/>{sheet.name}</button>)}<button className="add-tab" aria-label="Add a sheet" title="Add sheet" disabled={mobile} onClick={addSheet}><Icon name="plus" size={17}/></button></div><div className="zoom-indicator">100%</div></div>
+    <div className="bottom-bar"><button className="add-tab" aria-label="Add a sheet" title="Add sheet" onClick={addSheet} disabled={workbook.sheets.length >= 15}><Icon name="plus" size={17}/></button><div className="tab-strip" role="tablist" aria-label="Sheets">{workbook.sheets.map(sheet => renameId === sheet.id ? <input key={sheet.id} autoFocus className="rename-field" aria-label="New sheet name" maxLength={80} value={renameText} onChange={event => setRenameText(event.target.value)} onBlur={completeRename} onKeyDown={event => { if (event.key === 'Enter') completeRename(); else if (event.key === 'Escape') { cancelRenameRef.current = true; setRenameId(null); } }} /> : <button key={sheet.id} role="tab" aria-selected={sheet.id === activeSheetId} className={`sheet-tab ${sheet.id === activeSheetId ? 'current' : ''}`} onDoubleClick={() => { cancelRenameRef.current = false; setRenameId(sheet.id); setRenameText(sheet.name); }} onClick={() => switchSheet(sheet.id)}>{sheet.name}</button>)}</div><div className="zoom-indicator">100%</div></div>
     <footer className="statusbar"><div className="left-status"><span className="status-ready"><span className="ready-dot"/>Ready</span><span className="status-range">{addressAt(bounds(selection).top, bounds(selection).left)}{bounds(selection).top !== bounds(selection).bottom || bounds(selection).left !== bounds(selection).right ? `:${addressAt(bounds(selection).bottom, bounds(selection).right)}` : ''}</span><span className="sr-only" aria-live="polite">{message}</span><span className="toast-text" title={message}>{message}</span></div><div className="selection-stats"><span>Sum <b>{displayValue(stats.sum)}</b></span><span>Average <b>{displayValue(stats.average)}</b></span><span>Count <b>{stats.count.toLocaleString()}</b></span></div></footer>
 
-    {helpOpen && <div className="dialog-layer" onPointerDown={event => { if (event.target === event.currentTarget) setHelpOpen(false); }}><section className="shortcut-dialog" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts"><div className="dialog-header"><div><span className="section-identifier">Guide</span><h2>Work without the mouse</h2></div><button className="icon-button" title="Close guide" aria-label="Close guide" onClick={() => setHelpOpen(false)}><Icon name="close"/></button></div><div className="shortcut-list"><div><span>Move through cells</span><kbd>Arrow keys</kbd></div><div><span>Extend a selection</span><kbd>Shift + Arrow</kbd></div><div><span>Edit the active cell</span><kbd>F2</kbd></div><div><span>Commit an edit</span><kbd>Enter</kbd></div><div><span>Copy and paste</span><kbd>Ctrl / Cmd + C / V</kbd></div><div><span>Undo and redo</span><kbd>Ctrl / Cmd + Z / Y</kbd></div><div><span>Clear selected cells</span><kbd>Delete</kbd></div></div><div className="dialog-footer"><button className="text-button" onClick={() => { setHelpOpen(false); void resetDemo(); }}>Reset demo fixtures</button><button className="primary-button" onClick={() => setHelpOpen(false)}>Back to sheet</button></div></section></div>}
+    {functionsOpen && <FunctionDialog address={activeAddress} raw={functionSource} engine={engine} onClose={closeFunctions} onInsert={formula => {
+      functionDraftRef.current = null;
+      changeCell(activeAddress, formula);
+      setFunctionsOpen(false);
+      requestAnimationFrame(() => gridRef.current?.focus());
+    }}/>}
+    {helpOpen && <div className="dialog-layer" onPointerDown={event => { if (event.target === event.currentTarget) setHelpOpen(false); }}><section ref={guideRef} className="shortcut-dialog" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts"><div className="dialog-header"><div><h2>Work without the mouse</h2></div><button className="icon-button" title="Close guide" aria-label="Close guide" onClick={() => setHelpOpen(false)}><Icon name="close"/></button></div><div className="shortcut-list"><div><span>Move through cells</span><kbd>Arrow keys</kbd></div><div><span>Extend a selection</span><kbd>Shift + Arrow</kbd></div><div><span>Edit the active cell</span><kbd>F2</kbd></div><div><span>Insert a function</span><kbd>Shift + F3</kbd></div><div><span>Complete a function name</span><kbd>Tab</kbd></div><div><span>Commit an edit</span><kbd>Enter</kbd></div><div><span>Copy and paste</span><kbd>Ctrl / Cmd + C / V</kbd></div><div><span>Undo and redo</span><kbd>Ctrl / Cmd + Z / Y</kbd></div><div><span>Clear selected cells</span><kbd>Delete</kbd></div></div><div className="dialog-footer"><button className="text-button" onClick={() => { setHelpOpen(false); void resetDemo(); }}>Reset demo fixtures</button><button className="primary-button" onClick={() => setHelpOpen(false)}>Back to sheet</button></div></section></div>}
   </div>;
 }

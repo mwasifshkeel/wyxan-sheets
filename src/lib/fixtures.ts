@@ -1,8 +1,8 @@
 import { addressAt } from './address';
-import { DEFAULT_COL_WIDTH, MAX_COLS, type CellMap, type Sheet, type Workbook } from './types';
+import { DEFAULT_COL_WIDTH, INITIAL_COLS, type CellMap, type Sheet, type Workbook } from './types';
 
-const widths = () => Array.from({ length: MAX_COLS }, (_, col) => col === 0 ? 210 : col === 1 ? 164 : DEFAULT_COL_WIDTH);
-const sheet = (id: string, name: string, cells: CellMap): Sheet => ({ id, name, cells, widths: widths(), frozen: true });
+const widths = () => Array.from({ length: INITIAL_COLS }, (_, col) => col === 0 ? 210 : col === 1 ? 164 : DEFAULT_COL_WIDTH);
+const sheet = (id: string, name: string, cells: CellMap): Sheet => ({ id, name, cells, widths: widths(), frozen: false });
 
 function budget(): Sheet {
   const cells: CellMap = {

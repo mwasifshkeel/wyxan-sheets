@@ -1,47 +1,58 @@
 # Tally
 
-A responsive spreadsheet workspace built with Next.js App Router, React and TypeScript. The grid, formula engine and interface components are custom implementations.
+A small spreadsheet built with Next.js, React and TypeScript. I wrote the grid and formula engine without spreadsheet libraries or a component kit.
 
-## Run locally
+## Run it
 
-Requires Node.js 22 or newer.
+Node.js 22 or newer.
 
 ```bash
-npm install
+npm ci
 npm run dev
 ```
 
-Open `http://localhost:3000`.
+Open http://localhost:3000. To restore the budget, 10,000-row orders sheet and formula diagnostics:
+
+```bash
+npm run reset
+```
+
+Reload after resetting.
+
+## Checks
 
 ```bash
 npm run typecheck
 npm run lint
-npm run test
+npm test
 npm run build
-npm run reset
-```
-
-The reset command restores the three deterministic demo sheets on the next reload.
-
-## Browser testing
-
-```bash
 npx playwright install chromium firefox webkit
 npm run test:e2e
 ```
 
-The automated suite covers Chromium, Firefox, WebKit and a WebKit tablet viewport. Safari desktop and Opera should be checked manually as well.
+## Controls
 
-## Using the sheet
+- Click a cell, drag a range, or extend with Shift and the arrow keys. Row and column headings select whole rows and columns.
+- Use Functions in the navbar or click ƒx beside the formula bar to search functions, fill argument fields and preview the result. Shift+F3 opens the same picker.
+- Type `=SU` and press Tab or Enter to complete `SUM()`. Arrow keys browse suggestions; parameter hints show the current argument, including inside nested functions. This works in cells and the formula bar.
+- Available functions: `SUM`, `AVERAGE`, and `AVG` as an alias for `AVERAGE`. Arithmetic, parentheses, ranges and dollar-anchored cell references also work.
+- Type to replace a value, double-click or press F2 to edit it. Enter saves; Escape cancels. The formula bar works on phones too.
+- On touchscreens, swipe to scroll and drag the dot on the active cell to extend a selection.
+- Enter an address in the box beside the formula bar to jump there. The URL tracks the sheet and active cell.
+- Copy, cut and paste with the usual keyboard shortcuts. Copy and Paste buttons are also available; browser clipboard permissions apply.
+- Paste tab-separated text or an HTML table. Quoted tabs and line breaks stay in their cells. Pasting one value into a selected range fills it. Each paste is one undo step.
+- Sheets start with 26 columns (A–Z) and 10,000 rows. Paste or navigate beyond column Z to reveal more columns, or use Add column. The last supported column is XFD.
+- Drag a column edge to resize. Double-click it to fit its contents, or focus the edge and press Enter. Column A starts unfrozen; the toolbar can freeze it.
+- Add sheets with the plus beside the tabs. Rename from the toolbar or by double-clicking a tab. Delete sheet is undoable, and the last sheet cannot be deleted.
 
-Select cells with the mouse or arrows, extend a range with Shift, type to replace, press F2 to edit, or use the formula bar. Copy and paste with Ctrl+C/V or Command+C/V. One paste can be undone in a single step. The status bar shows selection statistics. Double-click a sheet tab to rename it, use the plus button to add a sheet, and use the column heading grip to resize a column.
+## Notes
 
-The workbook contains `Operating budget`, `10k orders` and `Formula diagnostics`. A route path such as `/s/budget?cell=E10` identifies a sheet and selected cell.
+Saving intentionally takes 350–1,500 ms and fails around one time in five, as required by the test. A browser recovery copy keeps pending edits; Retry sends them again. The server stores JSON in `.data`, so it needs a writable Node.js host.
 
-## Implementation
+I kept the test's exclusions: no file import/export, per-cell formatting, image paste, charts, collaboration, authentication or external database. Paste handles values and formulas, not Excel styling. More implementation notes are in [docs/DESIGN.md](docs/DESIGN.md), with checks and limits in [docs/QA.md](docs/QA.md).
 
-The grid virtualizes 10,000 rows. A dependency graph caches formula values and invalidates affected dependents. Raw cells are kept in sparse maps. Reversible transactions support undo and redo. Next.js route handlers load and atomically save workbook JSON. The save handler has an intentional delay and approximately 20% failure rate. A browser recovery copy protects unsaved edits, including changes made during an in-flight save.
+## Clipboard and security
 
-See `docs/DESIGN.md` for architecture and design decisions and `docs/QA.md` for checks and limitations.
+Pasted HTML is parsed inside an inert template and reduced to text. Scripts, event handlers, remote images and embedded content are never mounted in the grid. Copy escapes HTML, and formulas run through a restricted parser with limits on dependency size and depth. Unsupported functions cannot run JavaScript or fetch URLs.
 
-No grid, spreadsheet, formula, UI kit or chart library is used. A writable Node.js file system is required for server-side persistence.
+Clipboard input is limited to 5 MB and 50,000 cells. Saves and resets reject requests from other website origins. This is still a local demo without authentication: anyone who can directly reach the server can read it, and a script can call its API. Keep it local; the clipboard protections do not make it an internet-ready private workbook.

@@ -1,41 +1,89 @@
 import { addressAt, bounds, parseAddress, type Selection } from './address';
 import { MAX_COLS, MAX_ROWS, type CellMap, type CellChange } from './types';
 
-export function selectionToTsv(selection: Selection, values: CellMap): string {
+export const PASTE_LIMIT = 50000;
+export const CLIPBOARD_LIMIT = 5 * 1024 * 1024;
+export const INTERNAL_CLIPBOARD_TYPE = 'application/x-tally-selection';
+
+export function clipboardToken(data: DataTransfer): string {
+  // firefox drops custom mime types; its html clipboard keeps this marker.
+  return data.getData(INTERNAL_CLIPBOARD_TYPE) || /data-tally-copy="([a-f0-9-]{36})"/i.exec(data.getData('text/html').slice(0, 4096))?.[1] || '';
+}
+
+export function selectionToHtml(selection: Selection, values: CellMap, token: string): string {
   const b = bounds(selection);
+  if ((b.bottom - b.top + 1) * (b.right - b.left + 1) > PASTE_LIMIT) throw Error('Copy up to 50,000 cells at a time.');
+  const escape = (value: string) => value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);
   const rows: string[] = [];
   for (let row = b.top; row <= b.bottom; row++) {
     const cells: string[] = [];
-    for (let col = b.left; col <= b.right; col++) cells.push(values[addressAt(row, col)] ?? '');
+    for (let col = b.left; col <= b.right; col++) cells.push(`<td>${escape(values[addressAt(row, col)] || '').replace(/\n/g, '<br>')}</td>`);
+    rows.push(`<tr>${cells.join('')}</tr>`);
+  }
+  return `<table data-tally-copy="${escape(token)}">${rows.join('')}</table>`;
+}
+
+export function selectionToTsv(selection: Selection, values: CellMap): string {
+  const b = bounds(selection);
+  if ((b.bottom - b.top + 1) * (b.right - b.left + 1) > PASTE_LIMIT) throw Error('Copy up to 50,000 cells at a time.');
+  const rows: string[] = [];
+  for (let row = b.top; row <= b.bottom; row++) {
+    const cells: string[] = [];
+    for (let col = b.left; col <= b.right; col++) {
+      const value = values[addressAt(row, col)] ?? '';
+      cells.push(/[\t\n\r"]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value);
+    }
     rows.push(cells.join('\t'));
   }
   return rows.join('\n');
 }
 
-export function parsePastedText(source: string, limit = 50000): string[][] {
-  const lines = source.replace(/\r\n?/g, '\n').replace(/\n$/, '').split('\n');
+export function parsePastedText(source: string, limit = PASTE_LIMIT): string[][] {
+  if (source.length > CLIPBOARD_LIMIT) throw Error('Paste less than 5 MB of text at a time.');
+  const text = source.replace(/\r\n?/g, '\n');
   const rows: string[][] = [];
-  let total = 0;
-  for (const line of lines) {
-    const values = line.split('\t');
-    const count = Math.min(values.length, limit - total);
-    if (count <= 0) break;
-    rows.push(values.slice(0, count).map(value => value.slice(0, 4000)));
-    total += count;
+  let row: string[] = [], value = '', quoted = false, total = 0;
+  for (let i = 0; i <= text.length; i++) {
+    const char = text[i];
+    if (char === '"' && (quoted || value === '')) {
+      if (quoted && text[i + 1] === '"') { value += '"'; i++; }
+      else quoted = !quoted;
+    } else if ((!quoted && (char === '\t' || char === '\n')) || i === text.length) {
+      row.push(value.slice(0, 4000)); value = ''; total++;
+      if (char !== '\t' || total >= limit) { rows.push(row); row = []; }
+      if (total >= limit) break;
+    } else value += char;
   }
+  if (text.endsWith('\n') && rows.at(-1)?.length === 1 && rows.at(-1)?.[0] === '') rows.pop();
   return rows;
 }
 
-export function clipboardText(data: DataTransfer): string {
-  if (data.types.includes('text/plain')) return data.getData('text/plain');
+export function clipboardMatrix(data: DataTransfer): string[][] {
+  // template contents stay inert: pasted scripts and remote resources never run.
+  if (data.types.includes('text/plain')) return parsePastedText(data.getData('text/plain'));
   const html = data.getData('text/html');
-  if (!html) return '';
-  const document = new DOMParser().parseFromString(html, 'text/html');
-  const table = document.querySelector('table');
-  if (table) return Array.from(table.querySelectorAll('tr')).map(row =>
-    Array.from(row.querySelectorAll('th, td')).map(cell => cell.textContent || '').join('\t')
-  ).join('\n');
-  return document.body.textContent || '';
+  if (html.length > CLIPBOARD_LIMIT) throw Error('Paste less than 5 MB of HTML at a time.');
+  if (!html) return [];
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  const content = template.content;
+  content.querySelectorAll('script,style,iframe,object,embed,svg,math,link,meta,base,img,audio,video,source,track,template').forEach(node => node.remove());
+  content.querySelectorAll('br').forEach(node => node.replaceWith('\n'));
+  const table = content.querySelector('table');
+  if (!table) return parsePastedText(content.textContent || '');
+  const matrix: string[][] = [];
+  let total = 0;
+  for (const row of Array.from(table.rows)) {
+    const values: string[] = [];
+    for (const cell of Array.from(row.cells)) {
+      if (total >= PASTE_LIMIT) break;
+      values.push((cell.textContent || '').slice(0, 4000)); total++;
+      for (let span = 1; span < cell.colSpan && total < PASTE_LIMIT; span++) { values.push(''); total++; }
+    }
+    if (values.length) matrix.push(values);
+    if (total >= PASTE_LIMIT) break;
+  }
+  return matrix;
 }
 
 export function shiftFormula(raw: string, rowOffset: number, colOffset: number): string {

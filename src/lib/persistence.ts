@@ -1,9 +1,9 @@
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { parseAddress } from './address';
+import { addressAt, parseAddress } from './address';
 import { createFixtures } from './fixtures';
-import { DEFAULT_COL_WIDTH, MAX_COLS, type CellMap, type Sheet, type Workbook } from './types';
+import { DEFAULT_COL_WIDTH, INITIAL_COLS, MAX_COLS, type CellMap, type Sheet, type Workbook } from './types';
 
 const directory = path.join(process.cwd(), '.data');
 const location = path.join(directory, 'studio.json');
@@ -23,19 +23,21 @@ export function validateWorkbook(input: unknown): Workbook {
     if (!sheet.cells || typeof sheet.cells !== 'object' || Array.isArray(sheet.cells)) throw Error('invalid cells');
     const cells: CellMap = Object.create(null) as CellMap;
     for (const [address, value] of Object.entries(sheet.cells)) {
-      if (!parseAddress(address) || typeof value !== 'string' || value.length > 4000) throw Error('invalid cell');
-      if (value) cells[address.toUpperCase()] = value;
+      const position = parseAddress(address);
+      if (!position || typeof value !== 'string' || value.length > 4000) throw Error('invalid cell');
+      if (value) cells[addressAt(position.row, position.col)] = value;
     }
     const widths = Array.isArray(sheet.widths) ? sheet.widths : [];
+    const columnCount = Object.keys(cells).reduce((count, address) => Math.max(count, parseAddress(address)!.col + 1), Math.max(INITIAL_COLS, Math.min(MAX_COLS, widths.length)));
     return {
       id: sheet.id,
       name: sheet.name,
       cells,
-      widths: Array.from({ length: MAX_COLS }, (_, index) => {
+      widths: Array.from({ length: columnCount }, (_, index) => {
         const width: unknown = widths[index];
-        return typeof width === 'number' && Number.isFinite(width) ? Math.max(88, Math.min(360, width)) : DEFAULT_COL_WIDTH;
+        return typeof width === 'number' && Number.isFinite(width) ? Math.max(64, Math.min(600, width)) : DEFAULT_COL_WIDTH;
       }),
-      frozen: sheet.frozen !== false,
+      frozen: sheet.frozen === true,
     };
   });
   return { id: 'studio', name: typeof obj.name === 'string' ? obj.name.slice(0, 80) : 'Workbook', sheets, updatedAt: typeof obj.updatedAt === 'number' && Number.isFinite(obj.updatedAt) ? obj.updatedAt : Date.now() };

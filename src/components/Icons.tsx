@@ -1,11 +1,13 @@
 import type { ReactNode } from 'react';
 
-type Name = 'grid' | 'undo' | 'redo' | 'copy' | 'plus' | 'check' | 'alert' | 'refresh' | 'freeze' | 'sun' | 'moon' | 'keyboard' | 'edit' | 'chevron' | 'info' | 'menu' | 'close';
+type Name = 'grid' | 'undo' | 'redo' | 'copy' | 'paste' | 'trash' | 'plus' | 'check' | 'alert' | 'refresh' | 'freeze' | 'sun' | 'moon' | 'keyboard' | 'edit' | 'chevron' | 'info' | 'menu' | 'close';
 const paths: Record<Name, ReactNode> = {
   grid: <><rect x="3.5" y="3.5" width="17" height="17" rx="2"/><path d="M3.5 9h17M9 3.5v17M15 3.5v17M3.5 15h17"/></>,
   undo: <><path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-2"/></>,
   redo: <><path d="m15 14 5-5-5-5"/><path d="M20 9H10a6 6 0 0 0 0 12h2"/></>,
   copy: <><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></>,
+  paste: <><path d="M9 4H6a2 2 0 0 0-2 2v14h16V6a2 2 0 0 0-2-2h-3"/><rect x="9" y="2" width="6" height="5" rx="1"/><path d="M8 12h8M8 16h6"/></>,
+  trash: <><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></>,
   plus: <path d="M12 5v14M5 12h14"/>,
   check: <path d="m5 12 4 4L19 6"/>,
   alert: <><circle cx="12" cy="12" r="9"/><path d="M12 7v6M12 17h.01"/></>,

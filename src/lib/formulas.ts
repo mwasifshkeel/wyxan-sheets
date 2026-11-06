@@ -1,5 +1,6 @@
 import { addressAt, normalizedAddress, parseAddress } from './address';
 import { MAX_COLS, MAX_ROWS, type CellMap } from './types';
+import { findFunction } from './function-catalog';
 
 type Token = { kind: 'number' | 'word' | 'operator' | 'end'; text: string };
 type Node =
@@ -14,6 +15,9 @@ export type FormulaError = '#REF!' | '#DIV/0!' | '#CYCLE!' | '#VALUE!' | '#ERROR
 const ERRORS = new Set(['#REF!', '#DIV/0!', '#CYCLE!', '#VALUE!', '#ERROR!']);
 const MAX_FORMULA_LENGTH = 4000;
 const MAX_RANGE = 120000;
+const MAX_DEPENDENCIES = 500000;
+const MAX_REFERENCE_DEPTH = 256;
+const numberFormatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 });
 
 function tokenize(text: string): Token[] {
   const tokens: Token[] = [];
@@ -138,6 +142,19 @@ function references(node: Node, result = new Set<string>()): Set<string> {
   return result;
 }
 
+function referenceCost(node: Node, depth = 0): number {
+  if (depth > 128) throw Error('formula too deep');
+  if (node.kind === 'ref') return 1;
+  if (node.kind === 'range') {
+    const a = parseAddress(node.start), b = parseAddress(node.end);
+    return a && b ? (Math.abs(a.row - b.row) + 1) * (Math.abs(a.col - b.col) + 1) : 0;
+  }
+  if (node.kind === 'binary') return referenceCost(node.left, depth + 1) + referenceCost(node.right, depth + 1);
+  if (node.kind === 'unary') return referenceCost(node.node, depth + 1);
+  if (node.kind === 'call') return node.args.reduce((sum, arg) => sum + referenceCost(arg, depth + 1), 0);
+  return 0;
+}
+
 function asNumber(value: CellValue): number | FormulaError {
   if (typeof value === 'number') return value;
   if (ERRORS.has(value)) return value as FormulaError;
@@ -152,6 +169,7 @@ export class FormulaEngine {
   private dependencies = new Map<string, Set<string>>();
   private dependents = new Map<string, Set<string>>();
   private cache = new Map<string, CellValue>();
+  private dependencyCount = 0;
   constructor(cells: CellMap) {
     this.raw = { ...cells };
     for (const [address, value] of Object.entries(this.raw)) {
@@ -161,15 +179,29 @@ export class FormulaEngine {
   get size() { return this.raw ? Object.keys(this.raw).length : 0; }
   getRaw(address: string) { return this.raw[address] ?? ''; }
   private setDependencies(address: string, raw: string) {
+    this.dependencyCount -= this.dependencies.get(address)?.size || 0;
     for (const old of this.dependencies.get(address) || []) {
       const users = this.dependents.get(old);
       users?.delete(address);
       if (users?.size === 0) this.dependents.delete(old);
     }
-    const tree = parseFormula(raw);
+    if (!raw.startsWith('=')) {
+      this.parsed.delete(address);
+      this.dependencies.delete(address);
+      return;
+    }
+    let tree = parseFormula(raw);
+    // count ranges before expanding them; repeated large formulas share a fixed budget.
+    if (tree) {
+      try {
+        const cost = referenceCost(tree);
+        if (cost > MAX_RANGE || cost > MAX_DEPENDENCIES - this.dependencyCount) tree = null;
+      } catch { tree = null; }
+    }
     this.parsed.set(address, tree);
     const deps = tree ? references(tree) : new Set<string>();
     this.dependencies.set(address, deps);
+    this.dependencyCount += deps.size;
     for (const dep of deps) {
       if (!this.dependents.has(dep)) this.dependents.set(dep, new Set());
       this.dependents.get(dep)!.add(address);
@@ -195,11 +227,25 @@ export class FormulaEngine {
   evaluate(address: string): CellValue {
     const normalized = normalizedAddress(address);
     if (!normalized) return '#REF!';
-    return this.resolve(normalized, new Set());
+    try { return this.resolve(normalized, new Set()); }
+    catch { return '#ERROR!'; }
+  }
+  preview(raw: string, targetAddress: string): CellValue {
+    const savedCache = this.cache;
+    // preview can discover a prospective cycle; never cache that in the live sheet.
+    this.cache = new Map();
+    try {
+      const tree = parseFormula(raw);
+      if (!tree || referenceCost(tree) > MAX_RANGE) return '#ERROR!';
+      const result = this.walk(tree, new Set([targetAddress]));
+      return typeof result === 'number' && !Number.isFinite(result) ? '#VALUE!' : result;
+    } catch { return '#ERROR!'; }
+    finally { this.cache = savedCache; }
   }
   private resolve(address: string, visiting: Set<string>): CellValue {
     if (visiting.has(address)) return '#CYCLE!';
     if (this.cache.has(address)) return this.cache.get(address)!;
+    if (visiting.size >= MAX_REFERENCE_DEPTH) return '#ERROR!';
     const raw = this.getRaw(address);
     if (!raw) return '';
     if (raw.startsWith('=') && raw.includes('#REF!')) return '#REF!';
@@ -238,7 +284,8 @@ export class FormulaEngine {
         default: return left / right;
       }
     }
-    if (!['SUM', 'AVG'].includes(node.name)) return '#ERROR!';
+    const fn = findFunction(node.name);
+    if (!fn) return '#ERROR!';
     let sum = 0, count = 0;
     for (const arg of node.args) {
       const candidates = arg.kind === 'range' ? expandRange(arg.start, arg.end) : null;
@@ -260,13 +307,13 @@ export class FormulaEngine {
         sum += numeric; count++;
       }
     }
-    return node.name === 'SUM' ? sum : count ? sum / count : '#DIV/0!';
+    return fn.name === 'SUM' ? sum : count ? sum / count : '#DIV/0!';
   }
 }
 
 export function displayValue(value: CellValue): string {
   if (typeof value === 'string') return value;
-  return new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 }).format(value);
+  return numberFormatter.format(value);
 }
 
 export function isFormulaError(value: CellValue) {

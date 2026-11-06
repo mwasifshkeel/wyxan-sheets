@@ -1,7 +1,13 @@
 import { DEFAULT_COL_WIDTH, type HistoryEntry, type Sheet, type Workbook } from './types';
+import { parseAddress } from './address';
 
 export function applyEntry(source: Workbook, entry: HistoryEntry, reverse = false): Workbook {
   const workbook: Workbook = { ...source, sheets: [...source.sheets], updatedAt: Math.max(Date.now(), source.updatedAt + 1) };
+  if (entry.kind === 'delete') {
+    if (reverse) workbook.sheets.splice(entry.index, 0, entry.sheet);
+    else workbook.sheets = workbook.sheets.filter(sheet => sheet.id !== entry.sheet.id);
+    return workbook;
+  }
   if (entry.kind === 'add') {
     workbook.sheets = reverse ? workbook.sheets.filter(sheet => sheet.id !== entry.sheet.id) : [...workbook.sheets, entry.sheet];
     return workbook;
@@ -16,6 +22,8 @@ export function applyEntry(source: Workbook, entry: HistoryEntry, reverse = fals
       if (value === '') delete sheet.cells[change.address];
       else sheet.cells[change.address] = value;
     }
+    const columns = reverse && entry.columnsBefore !== undefined ? entry.columnsBefore : entry.changes.reduce((count, change) => Math.max(count, (parseAddress(change.address)?.col ?? 0) + 1), sheet.widths.length);
+    sheet.widths = Array.from({ length: columns }, (_, col) => sheet.widths[col] || DEFAULT_COL_WIDTH);
   } else if (entry.kind === 'rename') {
     sheet.name = reverse ? entry.before : entry.after;
   } else if (entry.kind === 'width') {
@@ -23,6 +31,8 @@ export function applyEntry(source: Workbook, entry: HistoryEntry, reverse = fals
     sheet.widths[entry.column] = (reverse ? entry.before : entry.after) || DEFAULT_COL_WIDTH;
   } else if (entry.kind === 'freeze') {
     sheet.frozen = reverse ? entry.before : entry.after;
+  } else if (entry.kind === 'columns') {
+    sheet.widths = reverse ? entry.before : entry.after;
   }
   workbook.sheets[index] = sheet;
   return workbook;

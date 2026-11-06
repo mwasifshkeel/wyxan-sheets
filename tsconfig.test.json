@@ -11,6 +11,6 @@
     "rootDir": "src",
     "noEmit": false
   },
-  "include": ["src/lib/address.ts", "src/lib/types.ts", "src/lib/formulas.ts", "src/lib/history.ts", "src/lib/fixtures.ts", "src/lib/clipboard.ts"],
+  "include": ["src/lib/address.ts", "src/lib/types.ts", "src/lib/formulas.ts", "src/lib/history.ts", "src/lib/fixtures.ts", "src/lib/clipboard.ts", "src/lib/persistence.ts", "src/lib/request-security.ts"],
   "exclude": ["node_modules"]
 }

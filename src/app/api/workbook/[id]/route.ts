@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { loadWorkbook, saveWorkbook } from '@/lib/persistence';
+import { isSameOriginMutation } from '@/lib/request-security';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -14,6 +15,7 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
 }
 
 export async function PUT(request: Request, context: { params: Promise<{ id: string }> }) {
+  if (!isSameOriginMutation(request)) return NextResponse.json({ error: 'Cross-origin changes are not allowed' }, { status: 403 });
   if ((await context.params).id !== 'studio') return NextResponse.json({ error: 'Workbook not found' }, { status: 404 });
   await new Promise(resolve => setTimeout(resolve, 350 + Math.floor(Math.random() * 1151)));
   if (Math.random() < 0.2) {

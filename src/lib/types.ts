@@ -1,5 +1,6 @@
 export const MAX_ROWS = 10000;
-export const MAX_COLS = 12;
+export const MAX_COLS = 16384;
+export const INITIAL_COLS = 26;
 export const ROW_HEIGHT = 34;
 export const HEADER_HEIGHT = 38;
 export const ROW_HEADER_WIDTH = 54;
@@ -21,7 +22,9 @@ export type Workbook = {
 };
 export type CellChange = { address: string; before: string; after: string };
 export type HistoryEntry =
-  | { kind: 'cells'; sheetId: string; changes: CellChange[] }
+  | { kind: 'delete'; sheet: Sheet; index: number }
+  | { kind: 'columns'; sheetId: string; before: number[]; after: number[] }
+  | { kind: 'cells'; sheetId: string; changes: CellChange[]; columnsBefore?: number }
   | { kind: 'rename'; sheetId: string; before: string; after: string }
   | { kind: 'add'; sheet: Sheet }
   | { kind: 'width'; sheetId: string; column: number; before: number; after: number }
