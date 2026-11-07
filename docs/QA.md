@@ -69,3 +69,11 @@ Added checks for the shared function catalog, Excel's AVERAGE name and the AVG a
 The frozen-column check changes horizontal scroll offsets and reads header/cell coordinates synchronously, before React can process a scroll event. It covers both directions, the far edge, and unfreezing. The phone touch check samples the frozen column during native horizontal swipes, then verifies vertical scrolling. The mutation check watches for PUT/POST requests while attempting edits and toggling the local freeze preference. Browser emulation still needs a physical-device follow-up.
 
 For this mobile change, lint, type checking, the Node suite and the production build passed. Across the full Chromium desktop/phone run and corrected targeted regressions, all 33 applicable cases passed. Desktop editing cases are intentionally skipped in the phone profile. Native touch swipes, phone landscape, tablet editing after resize and frozen-cell layering were exercised in Chromium emulation. No new Safari/physical-device result is claimed.
+
+## Loading, error recovery and navbar reset
+
+The app now shares its loading skeleton between route navigation, workbook fetching and fixture reset. The root error fallback covers layout failures, and route errors offer retry and workbook navigation. App Router uses `not-found.tsx` for the existing 404 page.
+
+New browser cases check delayed workbook loading, 404 recovery, reset progress while a save is pending, restored fixtures after reload, cleared undo/recovery state, cancellation, and a failed reset followed by retry. Reset cancels queued autosaves and waits for an active save before restoring fixtures. Phones retain their view-only reset restriction.
+
+Lint, type checking, the Node suite and the production build passed. The four applicable new browser cases and five existing layout, phone read-only and keyboard-guide regressions passed in installed Google Chrome using desktop and phone profiles; three inapplicable phone cases were skipped. These checks used a temporary Playwright configuration against a production server on localhost because the installed Playwright version's bundled Chromium was unavailable. Desktop, reset progress and 320px phone screenshots were inspected, with no navbar overflow.

@@ -10,6 +10,7 @@ import { Grid, type GridHandle } from './Grid';
 import { Icon } from './Icons';
 import { FormulaInput } from './FormulaInput';
 import { FunctionDialog } from './FunctionDialog';
+import { WorkspaceLoading } from './WorkspaceLoading';
 
 const PHONE_QUERY = '(max-width: 640px), (max-height: 640px) and (pointer: coarse)';
 const subscribePhone = (notify: () => void) => {
@@ -55,6 +56,8 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   const persistedRevRef = useRef(0);
   const [savePhase, setSavePhase] = useState<SavePhase>('loading');
   const [loadError, setLoadError] = useState('');
+  const [resetting, setResetting] = useState(false);
+  const resettingRef = useRef(false);
   const [message, setMessage] = useState('');
   const [renameId, setRenameId] = useState<string | null>(null);
   const [renameText, setRenameText] = useState('');
@@ -75,6 +78,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   const guideRef = useRef<HTMLElement>(null);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inFlightRef = useRef(false);
+  const saveCompletionRef = useRef<Promise<void>>(Promise.resolve());
   const saveNowRef = useRef<() => Promise<void>>(async () => {});
   const copiedRef = useRef<{ text: string; origin: { row: number; col: number }; sheetId: string; token: string; cut?: boolean } | null>(null);
   const activeSheet = workbook?.sheets.find(sheet => sheet.id === activeSheetId) || null;
@@ -167,12 +171,14 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   }, []);
 
   const saveNow = useCallback(async () => {
-    if (inFlightRef.current) return;
+    if (inFlightRef.current || resettingRef.current) return;
     const current = workbookRef.current;
     if (!current) return;
     const sentRevision = revisionRef.current;
     if (sentRevision === persistedRevRef.current) { setSavePhase('saved'); return; }
     inFlightRef.current = true;
+    let completeSave!: () => void;
+    saveCompletionRef.current = new Promise<void>(resolve => { completeSave = resolve; });
     setSavePhase('saving');
     try {
       const response = await fetch('/api/workbook/studio', {
@@ -200,6 +206,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
       setMessage(error instanceof Error ? error.message : 'Save failed.');
     } finally {
       inFlightRef.current = false;
+      completeSave();
     }
   }, []);
   useEffect(() => { saveNowRef.current = saveNow; }, [saveNow]);
@@ -226,7 +233,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   };
 
   const commit = useCallback((entry: HistoryEntry) => {
-    if (readOnly) return;
+    if (readOnly || resettingRef.current) return;
     const previous = workbookRef.current;
     if (!previous) return;
     if (entry.kind === 'cells') {
@@ -452,20 +459,39 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   };
 
   const resetDemo = async () => {
-    if (readOnly) return;
+    if (readOnly || resettingRef.current) return;
     if (!window.confirm('Reset all sheets to the original demo fixtures? Unsaved edits will be discarded.')) return;
+    resettingRef.current = true;
+    setResetting(true);
+    setHelpOpen(false);
+    setFunctionsOpen(false);
+    setRenameId(null);
+    setFormulaFocused(false);
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     try {
+      await saveCompletionRef.current;
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
       const response = await fetch('/api/reset', { method: 'POST' });
       if (!response.ok) throw Error();
-      localStorage.removeItem(BACKUP_KEY);
       const next = await response.json() as Workbook;
+      try { localStorage.removeItem(BACKUP_KEY); } catch { /* Browser storage may be unavailable. */ }
       workbookRef.current = next; setWorkbook(next);
       enginesRef.current = new Map(next.sheets.map(sheet => [sheet.id, new FormulaEngine(sheet.cells)]));
       setEngines(new Map(enginesRef.current));
       history.reset();
+      copiedRef.current = null;
+      functionDraftRef.current = null;
+      setViewFrozen({});
       revisionRef.current = 0; persistedRevRef.current = 0; setRevision(0); setSavePhase('saved'); setMessage('Demo data restored');
       switchSheet('budget');
-    } catch { setMessage('Reset failed. Check the server connection.'); }
+    } catch {
+      setMessage('Reset failed. Your workbook is unchanged. Check the connection and try Reset again.');
+      if (revisionRef.current !== persistedRevRef.current) setSavePhase('failed');
+    } finally {
+      resettingRef.current = false;
+      setResetting(false);
+      requestAnimationFrame(() => gridRef.current?.focus());
+    }
   };
 
   const populatedCells = useMemo(() => Object.entries(activeSheet?.cells || {}).map(([address, raw]) => ({
@@ -519,7 +545,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   const saveText = savePhase === 'saved' ? 'All changes saved' : savePhase === 'saving' ? 'Saving changes' : savePhase === 'failed' ? 'Save failed. Retry' : savePhase === 'local' ? 'Changes on this device' : 'Loading';
 
   if (loadError) return <main className="empty-page"><section className="empty-card"><span className="empty-mark"><Icon name="alert" size={26} /></span><h1>Couldn&apos;t open the workbook.</h1><p>{loadError}</p><button className="primary-button" onClick={() => void initialize()}>Try again</button></section></main>;
-  if (!workbook) return <div className="app-shell loading-state"><header className="topbar"><div className="brand-mark"><Icon name="grid" /></div><b className="brand-name">tally</b></header><div className="loading-content"><div className="loading-line wide"/><div className="loading-line"/><div className="loading-grid"/></div><p className="loading-copy" role="status">Opening Northline Studio...</p></div>;
+  if (!workbook || resetting) return <WorkspaceLoading resetting={resetting} />;
   if (!activeSheet || !engine) return <main className="empty-page"><section className="empty-card"><span className="empty-mark">Missing sheet</span><h1>That sheet doesn&apos;t exist.</h1><p>The address points to a sheet that isn&apos;t in this workbook.</p><button className="primary-button" onClick={() => switchSheet(workbook.sheets[0].id)}>Open {workbook.sheets[0].name}</button></section></main>;
 
   return <div className="app-shell" data-readonly={readOnly} onKeyDownCapture={event => {
@@ -529,6 +555,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
       <div className="brand-section"><span className="brand-mark"><Icon name="grid" size={21} /></span><span className="brand-name">tally</span><span className="brand-divider"/><div className="workbook-title"><h1>{activeSheet.name}</h1><span>{workbook.name}</span></div></div>
       <div className="header-actions">
         <button disabled={readOnly} className="functions-nav" aria-label="Functions" title="Functions (Shift+F3)" aria-haspopup="dialog" aria-expanded={functionsOpen} onPointerDown={event => event.preventDefault()} onClick={openFunctions}><span className="fx-label" aria-hidden="true">ƒx</span><span className="functions-nav-text">Functions</span></button>
+        <button disabled={readOnly} className="tool-button reset-nav" aria-label="Reset demo fixtures" title={readOnly ? 'Reset demo fixtures on desktop' : 'Reset demo fixtures'} onClick={() => void resetDemo()}><Icon name="refresh" size={16}/><span>Reset</span></button>
         <button className={`save-status ${savePhase === 'failed' ? 'failed' : ''}`} aria-label={saveText} title={message || saveText} onClick={() => { if (savePhase === 'failed' || savePhase === 'local') void saveNow(); }} disabled={savePhase === 'saved' || savePhase === 'saving'}><Icon name={savePhase === 'failed' ? 'alert' : savePhase === 'saved' ? 'check' : 'refresh'} size={15}/><span className="save-label">{saveText}</span><span className="save-mobile" aria-hidden="true">{savePhase === 'saved' ? 'Saved' : savePhase === 'saving' ? 'Saving' : savePhase === 'failed' ? 'Retry' : 'Unsaved'}</span></button>
         <span className="vertical-separator"/>
         <button className="icon-button theme-button" title="Toggle light and dark mode" aria-label="Toggle light and dark mode" onClick={() => setTheme(previous => { const current = previous === 'system' ? window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light' : previous; return current === 'light' ? 'dark' : 'light'; })}><Icon name={theme === 'dark' ? 'sun' : 'moon'} size={18}/></button>
@@ -564,6 +591,6 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
       setFunctionsOpen(false);
       requestAnimationFrame(() => gridRef.current?.focus());
     }}/>}
-    {helpOpen && <div className="dialog-layer" onPointerDown={event => { if (event.target === event.currentTarget) setHelpOpen(false); }}><section ref={guideRef} className="shortcut-dialog" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts"><div className="dialog-header"><div><h2>Work without the mouse</h2></div><button className="icon-button" title="Close guide" aria-label="Close guide" onClick={() => setHelpOpen(false)}><Icon name="close"/></button></div><div className="shortcut-list"><div><span>Move through cells</span><kbd>Arrow keys</kbd></div><div><span>Extend a selection</span><kbd>Shift + Arrow</kbd></div><div><span>Edit the active cell</span><kbd>F2</kbd></div><div><span>Insert a function</span><kbd>Shift + F3</kbd></div><div><span>Complete a function name</span><kbd>Tab</kbd></div><div><span>Commit an edit</span><kbd>Enter</kbd></div><div><span>Copy and paste</span><kbd>Ctrl / Cmd + C / V</kbd></div><div><span>Undo and redo</span><kbd>Ctrl / Cmd + Z / Y</kbd></div><div><span>Clear selected cells</span><kbd>Delete</kbd></div></div><div className="dialog-footer"><button disabled={readOnly} className="text-button" onClick={() => { setHelpOpen(false); void resetDemo(); }}>Reset demo fixtures</button><button className="primary-button" onClick={() => setHelpOpen(false)}>Back to sheet</button></div></section></div>}
+    {helpOpen && <div className="dialog-layer" onPointerDown={event => { if (event.target === event.currentTarget) setHelpOpen(false); }}><section ref={guideRef} className="shortcut-dialog" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts"><div className="dialog-header"><div><h2>Work without the mouse</h2></div><button className="icon-button" title="Close guide" aria-label="Close guide" onClick={() => setHelpOpen(false)}><Icon name="close"/></button></div><div className="shortcut-list"><div><span>Move through cells</span><kbd>Arrow keys</kbd></div><div><span>Extend a selection</span><kbd>Shift + Arrow</kbd></div><div><span>Edit the active cell</span><kbd>F2</kbd></div><div><span>Insert a function</span><kbd>Shift + F3</kbd></div><div><span>Complete a function name</span><kbd>Tab</kbd></div><div><span>Commit an edit</span><kbd>Enter</kbd></div><div><span>Copy and paste</span><kbd>Ctrl / Cmd + C / V</kbd></div><div><span>Undo and redo</span><kbd>Ctrl / Cmd + Z / Y</kbd></div><div><span>Clear selected cells</span><kbd>Delete</kbd></div></div><div className="dialog-footer"><button className="primary-button" onClick={() => setHelpOpen(false)}>Back to sheet</button></div></section></div>}
   </div>;
 }
