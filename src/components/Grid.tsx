@@ -9,6 +9,7 @@ import { DEFAULT_COL_WIDTH, HEADER_HEIGHT, INITIAL_COLS, MAX_ROWS, ROW_HEADER_WI
 export type GridHandle = { focus: () => void; moveTo: (row: number, col: number) => void; takeDraft: () => string | null; edit: (text: string) => void };
 type GridProps = {
   sheet: Sheet;
+  readOnly: boolean;
   engine: FormulaEngine;
   selection: Selection;
   revision: number;
@@ -26,7 +27,7 @@ type Editor = { row: number; col: number; text: string };
 const constrainWidth = (width: number) => Math.max(64, Math.min(600, width));
 
 export const Grid = forwardRef<GridHandle, GridProps>(function Grid(props, forwardedRef) {
-  const { sheet, engine, selection, onSelect, onChangeCell, onClear, onUndo, onRedo, onCopy, onCut, onPaste, onResize } = props;
+  const { sheet, readOnly, engine, selection, onSelect, onChangeCell, onClear, onUndo, onRedo, onCopy, onCut, onPaste, onResize } = props;
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
@@ -71,14 +72,15 @@ export const Grid = forwardRef<GridHandle, GridProps>(function Grid(props, forwa
   }, [offsets, widths, totalWidth, sheet.frozen]);
   // moving after layout also handles a newly revealed column and browser history.
   useEffect(() => { moveTo(focus.row, focus.col); }, [focus.row, focus.col, moveTo]);
-  useImperativeHandle(forwardedRef, () => ({ focus: () => scrollRef.current?.focus({ preventScroll: true }), moveTo, takeDraft: () => { const text = editor?.text ?? null; setEditor(null); return text; }, edit: text => setEditor({ row: focus.row, col: focus.col, text }) }), [moveTo, editor, focus.row, focus.col]);
+  useImperativeHandle(forwardedRef, () => ({ focus: () => scrollRef.current?.focus({ preventScroll: true }), moveTo, takeDraft: () => { const text = editor?.text ?? null; setEditor(null); return text; }, edit: text => { if (!readOnly) setEditor({ row: focus.row, col: focus.col, text }); } }), [moveTo, editor, focus.row, focus.col, readOnly]);
 
   const commitEditor = (next?: string) => {
-    if (!editor) return;
+    if (readOnly || !editor) return;
     onChangeCell(addressAt(editor.row, editor.col), next ?? editor.text);
     setEditor(null);
   };
   function startEdit(value?: string) {
+    if (readOnly) return;
     setEditor({ row: focus.row, col: focus.col, text: value ?? sheet.cells[addressAt(focus.row, focus.col)] ?? '' });
   }
   const handleKeyboard = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -106,6 +108,7 @@ export const Grid = forwardRef<GridHandle, GridProps>(function Grid(props, forwa
       onSelect(mod ? event.key === 'Home' ? 0 : MAX_ROWS - 1 : focus.row, event.key === 'Home' ? 0 : columnCount - 1, event.shiftKey); return;
     }
     if (event.key === 'Escape') { onSelect(focus.row, focus.col); return; }
+    if (readOnly) return;
     if (event.key === 'F2') { event.preventDefault(); startEdit(); return; }
     if (event.key === 'Backspace' || event.key === 'Delete') { event.preventDefault(); onClear(); return; }
     if (event.key.length === 1 && !event.metaKey) { event.preventDefault(); startEdit(event.key); }
@@ -171,20 +174,21 @@ export const Grid = forwardRef<GridHandle, GridProps>(function Grid(props, forwa
   const rect = bounds(selection);
   const selectColumn = (col: number) => { onSelect(MAX_ROWS - 1, col); onSelect(0, col, true); };
   const selectRow = (row: number) => { onSelect(row, columnCount - 1); onSelect(row, 0, true); };
-  const columnLeft = (col: number) => col === 0 && sheet.frozen ? Math.max(ROW_HEADER_WIDTH, viewport.left + ROW_HEADER_WIDTH) : offsets[col];
+  // Native sticky positioning stays in sync with compositor-driven touch scrolling.
+  const columnLeft = (col: number) => col === 0 && sheet.frozen ? ROW_HEADER_WIDTH : offsets[col];
 
   return <>
     <div className="sr-only" aria-live="polite" aria-atomic="true">Cell {activeAddress}. {activeRaw.startsWith('=') ? `Formula ${activeRaw}. Result ${activeResult}` : activeRaw ? `Value ${activeResult}` : 'Empty'}</div>
-    <div className="grid-viewport" ref={scrollRef} role="grid" tabIndex={0} aria-label={`${sheet.name} spreadsheet`} aria-rowcount={MAX_ROWS + 1} aria-colcount={columnCount + 1} aria-activedescendant={focus.row >= rowStart && focus.row < rowEnd && visibleCols.includes(focus.col) ? `cell-${sheet.id}-${activeAddress}` : undefined} onScroll={event => { const el = event.currentTarget; setViewport({ top: el.scrollTop, left: el.scrollLeft, height: el.clientHeight, width: el.clientWidth }); }} onKeyDown={handleKeyboard} onCopy={onCopy} onCut={onCut} onPaste={onPaste}>
+    <div className="grid-viewport" ref={scrollRef} role="grid" aria-readonly={readOnly} tabIndex={0} aria-label={`${sheet.name} spreadsheet`} aria-rowcount={MAX_ROWS + 1} aria-colcount={columnCount + 1} aria-activedescendant={focus.row >= rowStart && focus.row < rowEnd && visibleCols.includes(focus.col) ? `cell-${sheet.id}-${activeAddress}` : undefined} onScroll={event => { const el = event.currentTarget; setViewport({ top: el.scrollTop, left: el.scrollLeft, height: el.clientHeight, width: el.clientWidth }); }} onKeyDown={handleKeyboard} onCopy={onCopy} onCut={onCut} onPaste={onPaste}>
       <div className="grid-canvas" style={{ width: totalWidth, height: HEADER_HEIGHT + MAX_ROWS * ROW_HEIGHT }}>
         <div className="column-headings" role="row" style={{ width: totalWidth }}>
           <button role="columnheader" className="corner heading" style={{ width: ROW_HEADER_WIDTH }} aria-label="Select all" onClick={() => { onSelect(MAX_ROWS - 1, columnCount - 1); onSelect(0, 0, true); }} />
           {visibleCols.map(col => <div key={col} role="columnheader" aria-colindex={col + 2} className={`heading column-heading ${col >= rect.left && col <= rect.right ? 'axis-active' : ''} ${col === 0 && sheet.frozen ? 'frozen-column' : ''}`} style={{ width: widths[col], left: columnLeft(col) }}>
             <button className="axis-button" aria-label={`Select column ${columnLabel(col)}`} onClick={() => selectColumn(col)}>{columnLabel(col)}</button>
-            <span className="resize-grip" title={`Resize column ${columnLabel(col)}; double-click to fit`} role="separator" aria-orientation="vertical" aria-valuenow={widths[col]} aria-valuemin={64} aria-valuemax={600} aria-label={`Resize column ${columnLabel(col)}`} tabIndex={0} onDoubleClick={event => { event.stopPropagation(); autoFit(col); }} onPointerDown={event => handleResize(event, col)} onKeyDown={event => {
+            {!readOnly && <span className="resize-grip" title={`Resize column ${columnLabel(col)}; double-click to fit`} role="separator" aria-orientation="vertical" aria-valuenow={widths[col]} aria-valuemin={64} aria-valuemax={600} aria-label={`Resize column ${columnLabel(col)}`} tabIndex={0} onDoubleClick={event => { event.stopPropagation(); autoFit(col); }} onPointerDown={event => handleResize(event, col)} onKeyDown={event => {
               if (event.key === 'Enter') { event.preventDefault(); autoFit(col); }
               else if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') { event.preventDefault(); onResize(col, constrainWidth(widths[col] + (event.key === 'ArrowRight' ? 16 : -16))); }
-            }} />
+            }} />}
           </div>)}
         </div>
         {Array.from({ length: rowEnd - rowStart }, (_, index) => rowStart + index).map(row => <div key={row} className="grid-row" role="row" aria-rowindex={row + 2} style={{ top: HEADER_HEIGHT + row * ROW_HEIGHT, width: totalWidth, height: ROW_HEIGHT }}>
@@ -195,7 +199,7 @@ export const Grid = forwardRef<GridHandle, GridProps>(function Grid(props, forwa
             const active = focus.row === row && focus.col === col;
             const selected = isWithin(selection, row, col);
             const currentlyEditing = editor?.row === row && editor.col === col;
-            return <div key={address} id={`cell-${sheet.id}-${address}`} role="gridcell" aria-colindex={col + 2} aria-selected={selected} aria-label={`${address}, ${raw ? displayValue(value) : 'empty'}`} className={`data-cell ${selected ? 'is-selected' : ''} ${active ? 'is-active' : ''} ${raw.startsWith('=') ? 'is-computed' : ''} ${error ? 'is-error' : ''} ${col === 0 && sheet.frozen ? 'frozen-column' : ''}`} style={{ width: widths[col], left: columnLeft(col) }} onPointerDown={event => handleCellPointer(event, row, col)} onDoubleClick={() => { onSelect(row, col); setEditor({ row, col, text: raw }); }}>
+            return <div key={address} id={`cell-${sheet.id}-${address}`} role="gridcell" aria-colindex={col + 2} aria-selected={selected} aria-label={`${address}, ${raw ? displayValue(value) : 'empty'}`} className={`data-cell ${selected ? 'is-selected' : ''} ${active ? 'is-active' : ''} ${raw.startsWith('=') ? 'is-computed' : ''} ${error ? 'is-error' : ''} ${col === 0 && sheet.frozen ? 'frozen-column' : ''}`} style={{ width: widths[col], left: columnLeft(col) }} onPointerDown={event => handleCellPointer(event, row, col)} onDoubleClick={() => { onSelect(row, col); if (!readOnly) setEditor({ row, col, text: raw }); }}>
               {currentlyEditing ? <FormulaInput ref={inputRef} className="cell-input" aria-label={`Edit ${address}`} value={editor.text} onValueChange={text => setEditor({ ...editor, text })} onPointerDown={event => event.stopPropagation()} onBlur={() => commitEditor()} onKeyDown={event => {
                 event.stopPropagation();
                 if (event.key === 'Escape') { event.preventDefault(); setEditor(null); scrollRef.current?.focus(); }

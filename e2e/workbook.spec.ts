@@ -1,6 +1,17 @@
 import { expect, test } from '@playwright/test';
 
-test.beforeEach(async ({ request, page }) => {
+const phoneTests = new Set([
+  'invalid sheet and formula error render safely',
+  '10,000-row grid virtualizes the end of the sheet',
+  'layout remains usable on narrow viewports and theme toggles',
+  'phone view blocks edits and workbook controls',
+  'native phone touch drag and swipe scrolling',
+  'frozen column stays fixed before scroll events render',
+  'phone landscape stays view only and tablet editing returns',
+]);
+
+test.beforeEach(async ({ request, page }, testInfo) => {
+  test.skip(testInfo.project.name === 'phone' && !phoneTests.has(testInfo.title), 'Editing is available on desktop and tablet; phone has dedicated view-only checks.');
   await request.post('/api/reset');
   await page.goto('/s/budget?cell=B7');
   await expect(page.getByRole('grid')).toBeVisible();
@@ -76,7 +87,7 @@ test('layout remains usable on narrow viewports and theme toggles', async ({ pag
   await page.getByRole('button', { name: 'Toggle light and dark mode' }).click();
   await expect(page.locator('html')).toHaveAttribute('data-theme', /^(dark|light)$/);
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(page.getByRole('textbox', { name: 'Raw value of B7' })).toBeEditable();
+  await expect(page.getByRole('textbox', { name: 'Raw value of B7' })).not.toBeEditable();
   await expect(page.locator('body')).toHaveJSProperty('scrollWidth', 390);
 });
 
@@ -146,22 +157,41 @@ test('default scrolling, optional freeze and column keyboard autofit', async ({ 
   await expect(page.getByRole('button', { name: 'Freeze column A', exact: true })).toHaveAttribute('aria-pressed', 'false');
 });
 
-test('touch range handle selects cells without disabling normal scroll', async ({ page }) => {
+test('phone view blocks edits and workbook controls', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await goTo(page, 'A1');
-  const handle = page.getByRole('button', { name: 'Extend selection' });
-  const source = await handle.boundingBox();
-  const destination = await page.locator('#cell-budget-B3').boundingBox();
-  expect(source).not.toBeNull(); expect(destination).not.toBeNull();
-  await handle.dispatchEvent('pointerdown', { pointerId: 7, pointerType: 'touch', button: 0, clientX: source!.x + 10, clientY: source!.y + 10 });
-  await page.locator('body').dispatchEvent('pointermove', { pointerId: 7, pointerType: 'touch', clientX: destination!.x + 15, clientY: destination!.y + 15 });
-  await expect(page.locator('.status-range')).toHaveText('A1:B3');
-  await page.locator('body').dispatchEvent('pointerup', { pointerId: 7, pointerType: 'touch' });
-  expect(await page.locator('.grid-viewport').evaluate(element => getComputedStyle(element).touchAction)).toBe('auto');
-  await goTo(page, 'A2');
-  const formula = page.getByRole('textbox', { name: 'Raw value of A2' });
-  await formula.fill('edited on a phone'); await formula.press('Enter');
-  await expect(page.locator('#cell-budget-A2 .cell-content')).toHaveText('edited on a phone');
+  const writes: string[] = [];
+  page.on('request', request => { if (request.method() === 'PUT' || request.method() === 'POST') writes.push(request.url()); });
+  const grid = page.getByRole('grid');
+  await expect(grid).toHaveAttribute('aria-readonly', 'true');
+  await expect(page.getByText('View only · Edit on desktop')).toBeVisible();
+  const original = await page.locator('#cell-budget-B7 .cell-content').textContent();
+  await page.locator('#cell-budget-B7').dblclick();
+  await expect(page.locator('.cell-input')).toHaveCount(0);
+  await grid.focus();
+  for (const key of ['F2', '9', 'Delete', 'Backspace', 'ControlOrMeta+z', 'ControlOrMeta+y', 'Shift+F3']) await page.keyboard.press(key);
+  await pasteText(page, '999999');
+  await page.evaluate(() => document.querySelector('[role="grid"]')!.dispatchEvent(Object.defineProperty(new ClipboardEvent('cut', { bubbles: true, cancelable: true }), 'clipboardData', { value: new DataTransfer() })));
+  await expect(page.locator('#cell-budget-B7 .cell-content')).toHaveText(original!);
+  await expect(page.locator('.cell-input')).toHaveCount(0);
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.locator('.formula-input')).not.toBeEditable();
+  for (const name of ['Undo', 'Redo', 'Paste selection', 'Add column', 'Rename this sheet', 'Delete this sheet', 'Add a sheet', 'Functions', 'Insert function']) {
+    await expect(page.getByRole('button', { name, exact: true, includeHidden: true })).toBeDisabled();
+  }
+  await expect(page.getByRole('separator')).toHaveCount(0);
+  await page.getByRole('tab', { name: 'Operating budget' }).dblclick();
+  await expect(page.locator('.rename-field')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Freeze column A', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Unfreeze column A', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Keyboard shortcuts', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Reset demo fixtures' })).toBeDisabled();
+  await page.getByRole('button', { name: 'Back to sheet' }).click();
+  await page.waitForTimeout(1200); // Freezing on a phone must not start the debounced save.
+  expect(writes).toEqual([]);
+  await goTo(page, 'L10000');
+  await expect(page.locator('#cell-budget-L10000')).toBeVisible();
+  await page.getByRole('tab', { name: 'Formula diagnostics' }).click();
+  await expect(grid).toHaveAttribute('aria-label', 'Formula diagnostics spreadsheet');
 });
 
 test('large paste is bounded, undoable and horizontally virtualized', async ({ page }) => {
@@ -212,6 +242,7 @@ test('internal formulas shift, external text stays literal, range fill undoes on
 test('native phone touch drag and swipe scrolling', async ({ page, browserName }, testInfo) => {
   test.skip(browserName !== 'chromium' || testInfo.project.name !== 'phone', 'native touch through the Chromium device protocol');
   await goTo(page, 'A1');
+  await page.getByRole('button', { name: 'Freeze column A', exact: true }).click();
   const source = await page.getByRole('button', { name: 'Extend selection' }).boundingBox();
   const destination = await page.locator('#cell-budget-B3').boundingBox();
   const client = await page.context().newCDPSession(page);
@@ -220,7 +251,20 @@ test('native phone touch drag and swipe scrolling', async ({ page, browserName }
   await client.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: destination!.x + 20, y: destination!.y + 16 }] });
   await expect(page.locator('.status-range')).toHaveText('A1:B3');
   await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  await goTo(page, 'A1');
   const grid = await page.getByRole('grid').boundingBox();
+  const frozenX = (await page.locator('#cell-budget-A1').boundingBox())!.x;
+  for (const direction of [-1, 1]) {
+    const startX = direction === -1 ? 370 : 280;
+    const swipeY = grid!.y + 180;
+    await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: startX, y: swipeY }] });
+    for (let step = 1; step <= 6; step++) {
+      await client.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: startX + direction * step * 20, y: swipeY }] });
+      expect((await page.locator('#cell-budget-A1').boundingBox())!.x).toBeCloseTo(frozenX, 0);
+    }
+    await client.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    if (direction === -1) await expect.poll(() => page.getByRole('grid').evaluate(element => element.scrollLeft)).toBeGreaterThan(20);
+  }
   const startY = grid!.y + 300;
   await client.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 180, y: startY }] });
   for (let step = 1; step <= 5; step++) await client.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: 180, y: startY - step * 30 }] });
@@ -412,4 +456,58 @@ test('cancelling a circular preview preserves cells and unfinished formula text'
   await page.locator('.formula-input').press('Escape');
   await page.locator('.formula-input').press('Escape');
   await expect(page.locator('#cell-budget-C1 .cell-content')).toHaveText('');
+});
+
+
+test('frozen column stays fixed before scroll events render', async ({ page }) => {
+  await goTo(page, 'A1');
+  await page.getByRole('button', { name: 'Freeze column A', exact: true }).click();
+  await goTo(page, 'B1'); // The active scrolling cell must also pass behind frozen A.
+  const samples = await page.getByRole('grid').evaluate(element => {
+    const cell = document.querySelector('#cell-budget-A1')!;
+    const header = document.querySelector('.column-heading.frozen-column')!;
+    const rowNumber = document.querySelector('.row-number')!;
+    const x = cell.getBoundingClientRect().x;
+    return [0, 80, 300, 900, element.scrollWidth - element.clientWidth, 400, 20, 0].map(left => {
+      // Read synchronously: React cannot compensate for scrollLeft before this measurement.
+      element.scrollLeft = left;
+      const rect = cell.getBoundingClientRect();
+      const covering = document.elementFromPoint(rect.right - 20, rect.top + 10)?.closest('[role=gridcell]')?.id;
+      return { covering, cell: cell.getBoundingClientRect().x - x, header: header.getBoundingClientRect().x - x, row: rowNumber.getBoundingClientRect().x - element.getBoundingClientRect().x };
+    });
+  });
+  for (const sample of samples) {
+    expect(sample.covering).toBe('cell-budget-A1');
+    expect(sample.cell).toBeCloseTo(0, 1);
+    expect(sample.header).toBeCloseTo(0, 1);
+    expect(sample.row).toBeCloseTo(0, 1);
+  }
+  await page.getByRole('button', { name: 'Unfreeze column A', exact: true }).click();
+  const delta = await page.getByRole('grid').evaluate(element => {
+    const cell = document.querySelector('#cell-budget-A1')!;
+    element.scrollLeft = 0;
+    const before = cell.getBoundingClientRect().x;
+    element.scrollLeft = 100;
+    return cell.getBoundingClientRect().x - before;
+  });
+  expect(delta).toBeCloseTo(-100, 1);
+});
+
+test('phone landscape stays view only and tablet editing returns', async ({ page, browserName }, testInfo) => {
+  test.skip(browserName !== 'chromium' || testInfo.project.name !== 'phone', 'Requires a phone touch context.');
+  await page.setViewportSize({ width: 844, height: 390 });
+  await expect(page.getByRole('grid')).toHaveAttribute('aria-readonly', 'true');
+  await expect(page.locator('.formula-input')).not.toBeEditable();
+  await page.setViewportSize({ width: 1024, height: 768 });
+  await expect(page.getByRole('grid')).toHaveAttribute('aria-readonly', 'false');
+  await page.getByRole('grid').focus();
+  await page.keyboard.press('F2');
+  await page.getByRole('textbox', { name: 'Edit B7' }).fill('tablet draft');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.locator('.cell-input')).toHaveCount(0);
+  await expect(page.locator('#cell-budget-B7 .cell-content')).toHaveText('43000');
+  await page.setViewportSize({ width: 1024, height: 768 });
+  await page.locator('.formula-input').fill('60000');
+  await page.locator('.formula-input').press('Enter');
+  await expect(page.locator('#cell-budget-B7 .cell-content')).toHaveText('60000');
 });

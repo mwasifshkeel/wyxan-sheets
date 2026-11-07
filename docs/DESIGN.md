@@ -4,7 +4,7 @@ I kept the sheet as the main screen. The active sheet name and workbook name sit
 
 The green accent marks the active cell, selected headers and current tab. Formula results use blue; errors use red. The rest is neutral so a dense sheet is still readable. Light and dark themes use the same layout and follow the system until toggled. Fonts are local system fonts, so opening the sheet does not depend on a font download.
 
-On phones, the toolbar scrolls horizontally when needed, while the sheet scrolls independently. The title stays visible in the navbar. Inputs use 16px text to avoid zooming when editing on iOS. Swiping scrolls the grid; the active cell's handle starts a range drag. That keeps touch scrolling and selection from fighting over the same gesture. The formula bar supports single-cell editing and native text paste on mobile.
+Phones are view-only: widths up to 640px, plus short touch viewports up to 640px high for landscape phones. Tablet and desktop editing stay available. The formula bar exposes the selected raw value without editing or function assistance. Cell edits, paste, cut deletion, undo/redo, resizing, sheet changes and fixture reset are blocked. Navigation, selection, copy, tabs and themes remain available. Freeze is a local viewing preference on phones, without history or saving; desktop freeze remains an undoable workbook change. Swiping scrolls the grid; the active cell's handle starts a range selection. Changing between viewing and editing remounts the grid to discard unfinished cell drafts.
 
 ## Data and rendering
 
@@ -12,7 +12,7 @@ A workbook holds ordered sheets. Each sheet has a sparse map of raw cell strings
 
 Every sheet has 10,000 rows and starts with 26 columns (A–Z). Column widths grow when a paste or edit reaches further right. Navigation can reveal an empty column without saving a change; Add column explicitly saves one. Addresses stop at XFD10000. Both axes are virtualized, so a wide paste does not mount thousands of columns per row.
 
-The grid keeps row numbers and column headings visible. Only column A can be frozen, and it is off by default. Autofit measures computed cell text with canvas and clamps widths to 64–600px.
+The grid keeps row numbers and column headings visible. Frozen column A and its header use native CSS sticky positioning inside flex rows. Their horizontal position does not depend on React scroll updates, so browser touch scrolling cannot move them ahead of a render. Scroll state still drives virtualization. Only column A can be frozen, and it is off by default. Autofit measures computed cell text with canvas and clamps widths to 64–600px.
 
 ## Formulas
 

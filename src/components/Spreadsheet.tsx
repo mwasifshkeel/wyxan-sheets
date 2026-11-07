@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ClipboardEvent, type KeyboardEvent } from 'react';
 import { addressAt, bounds, clampPosition, isWithin, parseAddress, type Selection } from '@/lib/address';
 import { clipboardMatrix, clipboardToken, INTERNAL_CLIPBOARD_TYPE, PASTE_LIMIT, parsePastedText, pasteChanges, selectionToHtml, selectionToTsv } from '@/lib/clipboard';
 import { displayValue, FormulaEngine, isFormulaError } from '@/lib/formulas';
@@ -10,6 +10,14 @@ import { Grid, type GridHandle } from './Grid';
 import { Icon } from './Icons';
 import { FormulaInput } from './FormulaInput';
 import { FunctionDialog } from './FunctionDialog';
+
+const PHONE_QUERY = '(max-width: 640px), (max-height: 640px) and (pointer: coarse)';
+const subscribePhone = (notify: () => void) => {
+  const media = window.matchMedia(PHONE_QUERY);
+  media.addEventListener('change', notify);
+  return () => media.removeEventListener('change', notify);
+};
+const isPhone = () => window.matchMedia(PHONE_QUERY).matches;
 
 const BACKUP_KEY = 'tally:studio:pending';
 const initialSelection = { anchor: { row: 6, col: 1 }, focus: { row: 6, col: 1 } };
@@ -32,6 +40,8 @@ const navigate = (sheetId: string, row: number, col: number, push = false) => {
 };
 
 export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
+  const readOnly = useSyncExternalStore(subscribePhone, isPhone, () => true);
+  const [viewFrozen, setViewFrozen] = useState<Record<string, boolean>>({});
   const [workbook, setWorkbook] = useState<Workbook | null>(null);
   const workbookRef = useRef<Workbook | null>(null);
   const enginesRef = useRef<Map<string, FormulaEngine>>(new Map());
@@ -68,6 +78,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   const saveNowRef = useRef<() => Promise<void>>(async () => {});
   const copiedRef = useRef<{ text: string; origin: { row: number; col: number }; sheetId: string; token: string; cut?: boolean } | null>(null);
   const activeSheet = workbook?.sheets.find(sheet => sheet.id === activeSheetId) || null;
+  const gridSheet = activeSheet && readOnly && viewFrozen[activeSheetId] !== undefined ? { ...activeSheet, frozen: viewFrozen[activeSheetId] } : activeSheet;
   const engine = engines.get(activeSheetId);
   const activeAddress = addressAt(selection.focus.row, selection.focus.col);
   const activeRaw = activeSheet?.cells[activeAddress] || '';
@@ -215,6 +226,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   };
 
   const commit = useCallback((entry: HistoryEntry) => {
+    if (readOnly) return;
     const previous = workbookRef.current;
     if (!previous) return;
     if (entry.kind === 'cells') {
@@ -228,9 +240,10 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
     workbookRef.current = next;
     setWorkbook(next);
     dirty(next);
-  }, [dirty, history]);
+  }, [dirty, history, readOnly]);
 
   const undo = useCallback(() => {
+    if (readOnly) return;
     const current = workbookRef.current;
     if (!current) return;
     const { workbook: next, entry } = history.undoDetailed(current);
@@ -241,9 +254,10 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
       setActiveSheetId(fallback); navigate(fallback, 0, 0, true);
     }
     workbookRef.current = next; setWorkbook(next); dirty(next);
-  }, [dirty, activeSheetId, history]);
+  }, [dirty, activeSheetId, history, readOnly]);
 
   const redo = useCallback(() => {
+    if (readOnly) return;
     const current = workbookRef.current;
     if (!current) return;
     const { workbook: next, entry } = history.redoDetailed(current);
@@ -254,7 +268,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
       setActiveSheetId(fallback); navigate(fallback, 0, 0, true);
     }
     workbookRef.current = next; setWorkbook(next); dirty(next);
-  }, [dirty, activeSheetId, history]);
+  }, [dirty, activeSheetId, history, readOnly]);
 
   const select = useCallback((row: number, col: number, extend = false, push = false) => {
     const position = clampPosition(row, col);
@@ -317,6 +331,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   };
 
   const applyPaste = (matrix: string[][], token = '', text = '') => {
+    if (readOnly) return;
     const sheet = workbookRef.current?.sheets.find(sheet => sheet.id === activeSheetId);
     if (!sheet || !matrix.length) return;
     const rectangle = bounds(selectionRef.current);
@@ -341,6 +356,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   };
 
   const paste = (event: SheetClipboardEvent) => {
+    if (readOnly) { event.preventDefault(); return; }
     if (!activeSheet || event.target instanceof HTMLInputElement) return;
     event.preventDefault();
     try {
@@ -349,7 +365,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
       applyPaste(matrix, clipboardToken(event.clipboardData), event.clipboardData.getData('text/plain'));
     } catch (error) { setMessage((error as Error).message); }
   };
-  const cut = (event: SheetClipboardEvent) => copy(event, true);
+  const cut = (event: SheetClipboardEvent) => copy(event, !readOnly);
 
   const copyButton = async () => {
     if (!activeSheet) return;
@@ -436,6 +452,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   };
 
   const resetDemo = async () => {
+    if (readOnly) return;
     if (!window.confirm('Reset all sheets to the original demo fixtures? Unsaved edits will be discarded.')) return;
     try {
       const response = await fetch('/api/reset', { method: 'POST' });
@@ -471,6 +488,7 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   }, [activeSheet, engine, selection, populatedCells]);
 
   const openFunctions = () => {
+    if (readOnly) return;
     const cellDraft = gridRef.current?.takeDraft() ?? null;
     functionDraftRef.current = cellDraft !== null ? { value: cellDraft, source: 'cell', changed: true } : formulaFocused ? { value: formulaDraft, source: 'bar', changed: formulaChangedRef.current } : null;
     setFunctionSource(cellDraft ?? formulaDraft);
@@ -504,13 +522,13 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
   if (!workbook) return <div className="app-shell loading-state"><header className="topbar"><div className="brand-mark"><Icon name="grid" /></div><b className="brand-name">tally</b></header><div className="loading-content"><div className="loading-line wide"/><div className="loading-line"/><div className="loading-grid"/></div><p className="loading-copy" role="status">Opening Northline Studio...</p></div>;
   if (!activeSheet || !engine) return <main className="empty-page"><section className="empty-card"><span className="empty-mark">Missing sheet</span><h1>That sheet doesn&apos;t exist.</h1><p>The address points to a sheet that isn&apos;t in this workbook.</p><button className="primary-button" onClick={() => switchSheet(workbook.sheets[0].id)}>Open {workbook.sheets[0].name}</button></section></main>;
 
-  return <div className="app-shell" onKeyDownCapture={event => {
-    if (event.shiftKey && event.key === 'F3' && !functionsOpen) { event.preventDefault(); event.stopPropagation(); openFunctions(); }
+  return <div className="app-shell" data-readonly={readOnly} onKeyDownCapture={event => {
+    if (!readOnly && event.shiftKey && event.key === 'F3' && !functionsOpen) { event.preventDefault(); event.stopPropagation(); openFunctions(); }
   }}>
     <header className="topbar">
       <div className="brand-section"><span className="brand-mark"><Icon name="grid" size={21} /></span><span className="brand-name">tally</span><span className="brand-divider"/><div className="workbook-title"><h1>{activeSheet.name}</h1><span>{workbook.name}</span></div></div>
       <div className="header-actions">
-        <button className="functions-nav" aria-label="Functions" title="Functions (Shift+F3)" aria-haspopup="dialog" aria-expanded={functionsOpen} onPointerDown={event => event.preventDefault()} onClick={openFunctions}><span className="fx-label" aria-hidden="true">ƒx</span><span className="functions-nav-text">Functions</span></button>
+        <button disabled={readOnly} className="functions-nav" aria-label="Functions" title="Functions (Shift+F3)" aria-haspopup="dialog" aria-expanded={functionsOpen} onPointerDown={event => event.preventDefault()} onClick={openFunctions}><span className="fx-label" aria-hidden="true">ƒx</span><span className="functions-nav-text">Functions</span></button>
         <button className={`save-status ${savePhase === 'failed' ? 'failed' : ''}`} aria-label={saveText} title={message || saveText} onClick={() => { if (savePhase === 'failed' || savePhase === 'local') void saveNow(); }} disabled={savePhase === 'saved' || savePhase === 'saving'}><Icon name={savePhase === 'failed' ? 'alert' : savePhase === 'saved' ? 'check' : 'refresh'} size={15}/><span className="save-label">{saveText}</span><span className="save-mobile" aria-hidden="true">{savePhase === 'saved' ? 'Saved' : savePhase === 'saving' ? 'Saving' : savePhase === 'failed' ? 'Retry' : 'Unsaved'}</span></button>
         <span className="vertical-separator"/>
         <button className="icon-button theme-button" title="Toggle light and dark mode" aria-label="Toggle light and dark mode" onClick={() => setTheme(previous => { const current = previous === 'system' ? window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light' : previous; return current === 'light' ? 'dark' : 'light'; })}><Icon name={theme === 'dark' ? 'sun' : 'moon'} size={18}/></button>
@@ -518,11 +536,12 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
       </div>
     </header>
 
-    <div className="toolbar" role="toolbar" aria-label="Sheet controls">
-      <div className="toolbar-group"><button className="tool-button" disabled={!history.canUndo} onClick={undo} title="Undo (Ctrl+Z)" aria-label="Undo"><Icon name="undo"/><span>Undo</span></button><button className="tool-button" disabled={!history.canRedo} onClick={redo} title="Redo (Ctrl+Y)" aria-label="Redo"><Icon name="redo"/><span>Redo</span></button></div>
+    <div className={`toolbar ${readOnly ? 'view-only-toolbar' : ''}`} role="toolbar" aria-label="Sheet controls">
+      {readOnly && <span className="view-only-notice" role="status">View only · Edit on desktop</span>}
+      <div className="toolbar-group"><button className="tool-button" disabled={readOnly || !history.canUndo} onClick={undo} title="Undo (Ctrl+Z)" aria-label="Undo"><Icon name="undo"/><span>Undo</span></button><button className="tool-button" disabled={readOnly || !history.canRedo} onClick={redo} title="Redo (Ctrl+Y)" aria-label="Redo"><Icon name="redo"/><span>Redo</span></button></div>
       <span className="toolbar-divider"/>
-      <div className="toolbar-group"><button className="tool-button" onClick={() => void copyButton()} title="Copy selection" aria-label="Copy selection"><Icon name="copy"/><span>Copy</span></button><button className="tool-button" onClick={() => void pasteButton()} title="Paste selection" aria-label="Paste selection"><Icon name="paste"/><span>Paste</span></button><button className={`tool-button ${activeSheet.frozen ? 'is-toggled' : ''}`} onClick={() => commit({ kind: 'freeze', sheetId: activeSheetId, before: activeSheet.frozen, after: !activeSheet.frozen })} title="Toggle frozen first column" aria-label={activeSheet.frozen ? 'Unfreeze column A' : 'Freeze column A'} aria-pressed={activeSheet.frozen}><Icon name="freeze"/><span>{activeSheet.frozen ? 'Unfreeze' : 'Freeze'} column A</span></button></div>
-      <div className="toolbar-right"><button className="tool-button" onClick={addColumn} disabled={activeSheet.widths.length >= MAX_COLS} title="Add column" aria-label="Add column"><Icon name="plus"/><span>Column</span></button><button className="tool-button small" title="Rename this sheet" aria-label="Rename this sheet" onClick={() => { cancelRenameRef.current = false; setRenameId(activeSheetId); setRenameText(activeSheet.name); }}><Icon name="edit" size={16}/><span>Rename</span></button><button className="tool-button" title="Delete this sheet" aria-label="Delete this sheet" disabled={workbook.sheets.length <= 1} onClick={deleteSheet}><Icon name="trash"/><span>Delete sheet</span></button></div>
+      <div className="toolbar-group"><button className="tool-button" onClick={() => void copyButton()} title="Copy selection" aria-label="Copy selection"><Icon name="copy"/><span>Copy</span></button><button disabled={readOnly} className="tool-button" onClick={() => void pasteButton()} title="Paste selection" aria-label="Paste selection"><Icon name="paste"/><span>Paste</span></button><button className={`tool-button ${gridSheet?.frozen ? 'is-toggled' : ''}`} onClick={() => { if (readOnly) setViewFrozen(previous => ({ ...previous, [activeSheetId]: !gridSheet?.frozen })); else commit({ kind: 'freeze', sheetId: activeSheetId, before: activeSheet.frozen, after: !activeSheet.frozen }); }} title="Toggle frozen first column" aria-label={gridSheet?.frozen ? 'Unfreeze column A' : 'Freeze column A'} aria-pressed={gridSheet?.frozen}><Icon name="freeze"/><span>{gridSheet?.frozen ? 'Unfreeze' : 'Freeze'} column A</span></button></div>
+      <div className="toolbar-right"><button className="tool-button" onClick={addColumn} disabled={readOnly || activeSheet.widths.length >= MAX_COLS} title="Add column" aria-label="Add column"><Icon name="plus"/><span>Column</span></button><button className="tool-button small" title="Rename this sheet" disabled={readOnly} aria-label="Rename this sheet" onClick={() => { cancelRenameRef.current = false; setRenameId(activeSheetId); setRenameText(activeSheet.name); }}><Icon name="edit" size={16}/><span>Rename</span></button><button className="tool-button" title="Delete this sheet" aria-label="Delete this sheet" disabled={readOnly || workbook.sheets.length <= 1} onClick={deleteSheet}><Icon name="trash"/><span>Delete sheet</span></button></div>
     </div>
 
     <div className="formula-line"><input key={activeAddress} className="address-box" aria-label="Go to cell" defaultValue={activeAddress} spellCheck={false} onKeyDown={event => {
@@ -531,20 +550,20 @@ export function Spreadsheet({ initialSheetId }: { initialSheetId: string }) {
         if (position) { select(position.row, position.col, false, true); gridRef.current?.focus(); }
         else setMessage('Enter an address from A1 to XFD10000.');
       } else if (event.key === 'Escape') { event.currentTarget.value = activeAddress; gridRef.current?.focus(); }
-    }} /><button type="button" className="formula-symbol" aria-label="Insert function" title="Insert function (Shift+F3)" aria-haspopup="dialog" onPointerDown={event => event.preventDefault()} onClick={openFunctions}>ƒx</button><FormulaInput ref={formulaInputRef} id="formula-editor" className="formula-input" placeholder="Type a value or formula" aria-label={`Raw value of ${activeAddress}`} spellCheck={false} value={formulaDraft} onFocus={() => { formulaAddressRef.current = activeAddress; formulaChangedRef.current = false; setFormulaDraft(activeRaw); setFormulaFocused(true); }} onBlur={() => { if (skipFormulaBlurRef.current) { skipFormulaBlurRef.current = false; return; } if (formulaFocused) { if (formulaChangedRef.current) changeCell(formulaAddressRef.current || activeAddress, formulaDraft); setFormulaFocused(false); } }} onValueChange={value => { formulaChangedRef.current = true; setFormulaDraft(value); }} onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => { if (event.key === 'Enter') { event.preventDefault(); if (formulaChangedRef.current) changeCell(formulaAddressRef.current || activeAddress, formulaDraft); setFormulaFocused(false); gridRef.current?.focus(); } else if (event.key === 'Escape') { event.preventDefault(); skipFormulaBlurRef.current = true; setFormulaDraft(activeRaw); setFormulaFocused(false); gridRef.current?.focus(); } }}/><span className="formula-result" title="Computed result">{activeRaw.startsWith('=') ? activeResult : ''}</span></div>
+    }} /><button type="button" disabled={readOnly} className="formula-symbol" aria-label="Insert function" title="Insert function (Shift+F3)" aria-haspopup="dialog" onPointerDown={event => event.preventDefault()} onClick={openFunctions}>ƒx</button><FormulaInput readOnly={readOnly} ref={formulaInputRef} id="formula-editor" className="formula-input" placeholder="Type a value or formula" aria-label={`Raw value of ${activeAddress}`} spellCheck={false} value={readOnly ? activeRaw : formulaDraft} onFocus={() => { if (readOnly) return; formulaAddressRef.current = activeAddress; formulaChangedRef.current = false; setFormulaDraft(activeRaw); setFormulaFocused(true); }} onBlur={() => { if (skipFormulaBlurRef.current) { skipFormulaBlurRef.current = false; return; } if (formulaFocused) { if (!readOnly && formulaChangedRef.current) changeCell(formulaAddressRef.current || activeAddress, formulaDraft); setFormulaFocused(false); } }} onValueChange={value => { formulaChangedRef.current = true; setFormulaDraft(value); }} onKeyDown={(event: KeyboardEvent<HTMLInputElement>) => { if (event.key === 'Enter') { event.preventDefault(); if (!readOnly && formulaChangedRef.current) changeCell(formulaAddressRef.current || activeAddress, formulaDraft); setFormulaFocused(false); gridRef.current?.focus(); } else if (event.key === 'Escape') { event.preventDefault(); skipFormulaBlurRef.current = true; setFormulaDraft(activeRaw); setFormulaFocused(false); gridRef.current?.focus(); } }}/><span className="formula-result" title="Computed result">{activeRaw.startsWith('=') ? activeResult : ''}</span></div>
 
-    <div className="grid-area"><Grid key={activeSheetId} ref={gridRef} sheet={activeSheet} engine={engine} selection={selection} revision={revision} onSelect={select} onChangeCell={changeCell} onClear={clearSelection} onUndo={undo} onRedo={redo} onCopy={copy} onCut={cut} onPaste={paste} onResize={(column, width) => { const before = activeSheet.widths[column] || DEFAULT_COL_WIDTH; if (before !== width) commit({ kind: 'width', sheetId: activeSheetId, column, before, after: width }); }}/>
+    <div className="grid-area"><Grid readOnly={readOnly} key={`${activeSheetId}-${readOnly}`} ref={gridRef} sheet={gridSheet!} engine={engine} selection={selection} revision={revision} onSelect={select} onChangeCell={changeCell} onClear={clearSelection} onUndo={undo} onRedo={redo} onCopy={copy} onCut={cut} onPaste={paste} onResize={(column, width) => { const before = activeSheet.widths[column] || DEFAULT_COL_WIDTH; if (before !== width) commit({ kind: 'width', sheetId: activeSheetId, column, before, after: width }); }}/>
     </div>
 
-    <div className="bottom-bar"><button className="add-tab" aria-label="Add a sheet" title="Add sheet" onClick={addSheet} disabled={workbook.sheets.length >= 15}><Icon name="plus" size={17}/></button><div className="tab-strip" role="tablist" aria-label="Sheets">{workbook.sheets.map(sheet => renameId === sheet.id ? <input key={sheet.id} autoFocus className="rename-field" aria-label="New sheet name" maxLength={80} value={renameText} onChange={event => setRenameText(event.target.value)} onBlur={completeRename} onKeyDown={event => { if (event.key === 'Enter') completeRename(); else if (event.key === 'Escape') { cancelRenameRef.current = true; setRenameId(null); } }} /> : <button key={sheet.id} role="tab" aria-selected={sheet.id === activeSheetId} className={`sheet-tab ${sheet.id === activeSheetId ? 'current' : ''}`} onDoubleClick={() => { cancelRenameRef.current = false; setRenameId(sheet.id); setRenameText(sheet.name); }} onClick={() => switchSheet(sheet.id)}>{sheet.name}</button>)}</div><div className="zoom-indicator">100%</div></div>
+    <div className="bottom-bar"><button className="add-tab" aria-label="Add a sheet" title="Add sheet" onClick={addSheet} disabled={readOnly || workbook.sheets.length >= 15}><Icon name="plus" size={17}/></button><div className="tab-strip" role="tablist" aria-label="Sheets">{workbook.sheets.map(sheet => !readOnly && renameId === sheet.id ? <input key={sheet.id} autoFocus className="rename-field" aria-label="New sheet name" maxLength={80} value={renameText} onChange={event => setRenameText(event.target.value)} onBlur={completeRename} onKeyDown={event => { if (event.key === 'Enter') completeRename(); else if (event.key === 'Escape') { cancelRenameRef.current = true; setRenameId(null); } }} /> : <button key={sheet.id} role="tab" aria-selected={sheet.id === activeSheetId} className={`sheet-tab ${sheet.id === activeSheetId ? 'current' : ''}`} onDoubleClick={() => { if (readOnly) return; cancelRenameRef.current = false; setRenameId(sheet.id); setRenameText(sheet.name); }} onClick={() => switchSheet(sheet.id)}>{sheet.name}</button>)}</div><div className="zoom-indicator">100%</div></div>
     <footer className="statusbar"><div className="left-status"><span className="status-ready"><span className="ready-dot"/>Ready</span><span className="status-range">{addressAt(bounds(selection).top, bounds(selection).left)}{bounds(selection).top !== bounds(selection).bottom || bounds(selection).left !== bounds(selection).right ? `:${addressAt(bounds(selection).bottom, bounds(selection).right)}` : ''}</span><span className="sr-only" aria-live="polite">{message}</span><span className="toast-text" title={message}>{message}</span></div><div className="selection-stats"><span>Sum <b>{displayValue(stats.sum)}</b></span><span>Average <b>{displayValue(stats.average)}</b></span><span>Count <b>{stats.count.toLocaleString()}</b></span></div></footer>
 
-    {functionsOpen && <FunctionDialog address={activeAddress} raw={functionSource} engine={engine} onClose={closeFunctions} onInsert={formula => {
+    {functionsOpen && !readOnly && <FunctionDialog address={activeAddress} raw={functionSource} engine={engine} onClose={closeFunctions} onInsert={formula => {
       functionDraftRef.current = null;
       changeCell(activeAddress, formula);
       setFunctionsOpen(false);
       requestAnimationFrame(() => gridRef.current?.focus());
     }}/>}
-    {helpOpen && <div className="dialog-layer" onPointerDown={event => { if (event.target === event.currentTarget) setHelpOpen(false); }}><section ref={guideRef} className="shortcut-dialog" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts"><div className="dialog-header"><div><h2>Work without the mouse</h2></div><button className="icon-button" title="Close guide" aria-label="Close guide" onClick={() => setHelpOpen(false)}><Icon name="close"/></button></div><div className="shortcut-list"><div><span>Move through cells</span><kbd>Arrow keys</kbd></div><div><span>Extend a selection</span><kbd>Shift + Arrow</kbd></div><div><span>Edit the active cell</span><kbd>F2</kbd></div><div><span>Insert a function</span><kbd>Shift + F3</kbd></div><div><span>Complete a function name</span><kbd>Tab</kbd></div><div><span>Commit an edit</span><kbd>Enter</kbd></div><div><span>Copy and paste</span><kbd>Ctrl / Cmd + C / V</kbd></div><div><span>Undo and redo</span><kbd>Ctrl / Cmd + Z / Y</kbd></div><div><span>Clear selected cells</span><kbd>Delete</kbd></div></div><div className="dialog-footer"><button className="text-button" onClick={() => { setHelpOpen(false); void resetDemo(); }}>Reset demo fixtures</button><button className="primary-button" onClick={() => setHelpOpen(false)}>Back to sheet</button></div></section></div>}
+    {helpOpen && <div className="dialog-layer" onPointerDown={event => { if (event.target === event.currentTarget) setHelpOpen(false); }}><section ref={guideRef} className="shortcut-dialog" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts"><div className="dialog-header"><div><h2>Work without the mouse</h2></div><button className="icon-button" title="Close guide" aria-label="Close guide" onClick={() => setHelpOpen(false)}><Icon name="close"/></button></div><div className="shortcut-list"><div><span>Move through cells</span><kbd>Arrow keys</kbd></div><div><span>Extend a selection</span><kbd>Shift + Arrow</kbd></div><div><span>Edit the active cell</span><kbd>F2</kbd></div><div><span>Insert a function</span><kbd>Shift + F3</kbd></div><div><span>Complete a function name</span><kbd>Tab</kbd></div><div><span>Commit an edit</span><kbd>Enter</kbd></div><div><span>Copy and paste</span><kbd>Ctrl / Cmd + C / V</kbd></div><div><span>Undo and redo</span><kbd>Ctrl / Cmd + Z / Y</kbd></div><div><span>Clear selected cells</span><kbd>Delete</kbd></div></div><div className="dialog-footer"><button disabled={readOnly} className="text-button" onClick={() => { setHelpOpen(false); void resetDemo(); }}>Reset demo fixtures</button><button className="primary-button" onClick={() => setHelpOpen(false)}>Back to sheet</button></div></section></div>}
   </div>;
 }
